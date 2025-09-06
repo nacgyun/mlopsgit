@@ -10,12 +10,35 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Apply Kubernetes manifests
+      - name: Install kubectl (stable)
         run: |
           set -eux
-          kubectl -n mlops apply -f k8s/   # ← 여기 manifests 있는 폴더 지정
-          kubectl -n mlops rollout status deploy/light-serve --timeout=300s
+          curl -L https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Setup in-cluster context (use SA token)
+        run: |
+          set -eux
+          echo "KUBE_HOST=https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" >> $GITHUB_ENV
+          echo "KUBE_NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" >> $GITHUB_ENV
+
+      - name: Sanity check
+        run: |
+          set -eux
+          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n "$KUBE_NS" get pod -o wide | head -n 20
+
+      - name: Apply manifests & rollout
+        run: |
+          set -eux
+          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          # 매니페스트 위치에 맞게 경로 조정
+          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops apply -f k8s/
+          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops rollout status deploy/light-serve --timeout=300s
 
