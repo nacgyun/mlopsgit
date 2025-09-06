@@ -12,29 +12,30 @@ jobs:
     defaults:
       run:
         shell: bash
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup kubectl (no sudo)
+      # curl 없이 동작하는 JS 액션 (Node 기반) – PATH 자동 설정
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Diagnostics (whoami/env/kubectl)
         run: |
-          set -euo pipefail
-          if ! command -v kubectl >/dev/null 2>&1; then
-            mkdir -p "$HOME/bin"
-            curl -fsSL -o "$HOME/bin/kubectl" \
-              "https://storage.googleapis.com/kubernetes-release/release/$(curl -fsSL https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
-            chmod +x "$HOME/bin/kubectl"
-          fi
-          # 중요: 이 step에서도 바로 쓰이도록 PATH 반영
-          export PATH="$HOME/bin:$PATH"
+          set -x
+          whoami
+          uname -a
+          which kubectl || true
           kubectl version --client
-          # 다음 step들에서도 쓰이도록
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          echo "KUBECONFIG=${KUBECONFIG:-<none>}"
+          ls -l /var/run/secrets/kubernetes.io/serviceaccount || true
 
       - name: Configure in-cluster kubeconfig
         run: |
           set -euo pipefail
-          export PATH="$HOME/bin:$PATH"
           API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
           SA_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
           CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -47,14 +48,14 @@ jobs:
       - name: Apply manifests
         run: |
           set -euo pipefail
-          export PATH="$HOME/bin:$PATH"
           for d in k8s manifests kubernetes; do
             if [ -d "$d" ]; then MANIFEST_DIR="$d"; break; fi
           done
           if [ -z "${MANIFEST_DIR:-}" ]; then
-            echo "::error::No manifest directory found (expected one of: k8s/, manifests/, kubernetes/)"
+            echo "::error::No manifest directory found (expected: k8s/ or manifests/ or kubernetes/)"
             exit 1
           fi
-          echo "Applying from: $MANIFEST_DIR"
+          echo "Applying from $MANIFEST_DIR"
           kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
           kubectl -n "$NAMESPACE" get all -o wide
+
