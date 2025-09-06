@@ -1,0 +1,70 @@
+name: CI-CD
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "app/**"
+      - ".github/workflows/ci-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write       # GHCR 푸시
+  id-token: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/light-serve
+  TAG: ${{ github.sha }}
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    needs: build_and_push
+    runs-on: self-hosted   # 클러스터 안 gh-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      # 혹시 러너 이미지에 kubectl이 없을 수 있으니 안전하게 설치
+      - name: Install kubectl (stable)
+        run: |
+          set -eux
+          curl -L https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Sanity - cluster nodes
+        run: kubectl get node -o wide
+
+      - name: Update image and rollout
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+        run: |
+          set -eux
+          # 컨테이너 이름이 'light-serve' 인지 확인. 다르면 아래 이름만 맞춰줘.
+          kubectl -n mlops set image deploy/light-serve light-serve=${IMAGE} --record
+          kubectl -n mlops rollout status deploy/light-serve --timeout=300s
+
+      - name: Show pods
+        run: kubectl -n mlops get pods -o wide
+
