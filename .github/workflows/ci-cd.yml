@@ -46,9 +46,8 @@ jobs:
           set -eux
           TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
           CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          # 매니페스트 디렉터리 자동 탐지 (k8s/ 또는 manifests/)
           if [ -d k8s ]; then DIR=k8s;
           elif [ -d manifests ]; then DIR=manifests;
-          else echo "❌ 매니페스트 디렉터리를 찾지 못했어요 (k8s/ 또는 manifests/ 기대)"; exit 1; fi
+          else echo "❌ 매니페스트 디렉터리를 찾지 못했어요 (k8s/ 또는 manifests/ 필요)"; exit 1; fi
           kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops apply -f "$DIR/"
           kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops rollout status deploy/light-serve --timeout=300s
