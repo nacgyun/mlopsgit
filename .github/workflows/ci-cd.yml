@@ -6,7 +6,7 @@ on:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, Linux, X64]   # 우리 k8s 안의 self-hosted runner로만 실행
+    runs-on: [self-hosted, Linux, X64]
     env:
       NAMESPACE: mlops
     defaults:
@@ -16,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl if missing (no sudo)
+      - name: Setup kubectl (no sudo)
         run: |
           set -euo pipefail
           if ! command -v kubectl >/dev/null 2>&1; then
@@ -24,13 +24,17 @@ jobs:
             curl -fsSL -o "$HOME/bin/kubectl" \
               "https://storage.googleapis.com/kubernetes-release/release/$(curl -fsSL https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
             chmod +x "$HOME/bin/kubectl"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
           fi
+          # 중요: 이 step에서도 바로 쓰이도록 PATH 반영
+          export PATH="$HOME/bin:$PATH"
           kubectl version --client
+          # 다음 step들에서도 쓰이도록
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Configure in-cluster kubeconfig (use SA token)
+      - name: Configure in-cluster kubeconfig
         run: |
           set -euo pipefail
+          export PATH="$HOME/bin:$PATH"
           API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
           SA_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
           CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -38,13 +42,12 @@ jobs:
           kubectl config set-credentials sa --token="$SA_TOKEN"
           kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace="$NAMESPACE"
           kubectl config use-context in-cluster
-          echo "RBAC check:" && kubectl auth can-i "*" "*" -n "$NAMESPACE" || true
           kubectl get ns "$NAMESPACE"
 
       - name: Apply manifests
         run: |
           set -euo pipefail
-          # manifest 디렉터리 자동 탐지 (없으면 에러)
+          export PATH="$HOME/bin:$PATH"
           for d in k8s manifests kubernetes; do
             if [ -d "$d" ]; then MANIFEST_DIR="$d"; break; fi
           done
@@ -52,10 +55,6 @@ jobs:
             echo "::error::No manifest directory found (expected one of: k8s/, manifests/, kubernetes/)"
             exit 1
           fi
-
-          echo "Applying manifests from: $MANIFEST_DIR"
+          echo "Applying from: $MANIFEST_DIR"
           kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
-
-          echo "Cluster status:"
           kubectl -n "$NAMESPACE" get all -o wide
-
