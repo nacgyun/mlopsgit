@@ -6,10 +6,12 @@ on:
         description: "Specific version (optional)"
         required: false
         default: ""
+  push:
+    branches: ["master"]   # ������ 추가: master에 푸시될 때 1회 자동 실행
 
 jobs:
   promote:
-    runs-on: self-hosted   # 클러스터 안 러너 쓰면 self-hosted, 외부면 ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
