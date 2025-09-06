@@ -2,52 +2,60 @@ name: CI/CD
 
 on:
   push:
-    branches: ["master"]
-  workflow_dispatch:
+    branches: [ master ]
 
 jobs:
   deploy:
-    runs-on: [self-hosted, Linux, X64]
-
+    runs-on: [self-hosted, Linux, X64]   # 우리 k8s 안의 self-hosted runner로만 실행
+    env:
+      NAMESPACE: mlops
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl (no sudo)
+      - name: Install kubectl if missing (no sudo)
         run: |
-          set -eux
-          KVER=$(curl -Ls https://dl.k8s.io/release/stable.txt)
-          curl -L "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o "$RUNNER_TEMP/kubectl"
-          chmod +x "$RUNNER_TEMP/kubectl"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          set -euo pipefail
+          if ! command -v kubectl >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            curl -fsSL -o "$HOME/bin/kubectl" \
+              "https://storage.googleapis.com/kubernetes-release/release/$(curl -fsSL https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/bin/kubectl"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+          fi
           kubectl version --client
 
-      - name: Setup in-cluster env
+      - name: Configure in-cluster kubeconfig (use SA token)
         run: |
-          set -eux
-          echo "KUBE_HOST=https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" >> "$GITHUB_ENV"
-          echo "KUBE_NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" >> "$GITHUB_ENV"
+          set -euo pipefail
+          API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+          SA_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+          CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+          kubectl config set-cluster in-cluster --server="$API" --certificate-authority="$CA" --embed-certs=true
+          kubectl config set-credentials sa --token="$SA_TOKEN"
+          kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace="$NAMESPACE"
+          kubectl config use-context in-cluster
+          echo "RBAC check:" && kubectl auth can-i "*" "*" -n "$NAMESPACE" || true
+          kubectl get ns "$NAMESPACE"
 
-      - name: Show repo tree (debug)
+      - name: Apply manifests
         run: |
-          set -eux
-          pwd; ls -la
-          find . -maxdepth 3 -type f -name '*.y*ml' -print || true
+          set -euo pipefail
+          # manifest 디렉터리 자동 탐지 (없으면 에러)
+          for d in k8s manifests kubernetes; do
+            if [ -d "$d" ]; then MANIFEST_DIR="$d"; break; fi
+          done
+          if [ -z "${MANIFEST_DIR:-}" ]; then
+            echo "::error::No manifest directory found (expected one of: k8s/, manifests/, kubernetes/)"
+            exit 1
+          fi
 
-      - name: Sanity check access
-        run: |
-          set -eux
-          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-          CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n "$KUBE_NS" get nodes
+          echo "Applying manifests from: $MANIFEST_DIR"
+          kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
 
-      - name: Apply manifests & rollout
-        run: |
-          set -eux
-          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-          CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          if [ -d k8s ]; then DIR=k8s;
-          elif [ -d manifests ]; then DIR=manifests;
-          else echo "❌ 매니페스트 디렉터리를 찾지 못했어요 (k8s/ 또는 manifests/ 필요)"; exit 1; fi
-          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops apply -f "$DIR/"
-          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops rollout status deploy/light-serve --timeout=300s
+          echo "Cluster status:"
+          kubectl -n "$NAMESPACE" get all -o wide
+
