@@ -13,32 +13,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl (stable)
+      - name: Install kubectl (no sudo)
         run: |
           set -eux
-          curl -L https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl -o kubectl
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          KVER=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+          curl -L "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o "$RUNNER_TEMP/kubectl"
+          chmod +x "$RUNNER_TEMP/kubectl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
           kubectl version --client
 
-      - name: Setup in-cluster context (use SA token)
+      - name: Setup in-cluster env
         run: |
           set -eux
-          echo "KUBE_HOST=https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" >> $GITHUB_ENV
-          echo "KUBE_NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" >> $GITHUB_ENV
+          echo "KUBE_HOST=https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" >> "$GITHUB_ENV"
+          echo "KUBE_NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" >> "$GITHUB_ENV"
 
-      - name: Sanity check
+      - name: Show repo tree (debug)
+        run: |
+          set -eux
+          pwd; ls -la
+          find . -maxdepth 3 -type f -name '*.y*ml' -print || true
+
+      - name: Sanity check access
         run: |
           set -eux
           TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
           CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n "$KUBE_NS" get pod -o wide | head -n 20
+          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n "$KUBE_NS" get nodes
 
       - name: Apply manifests & rollout
         run: |
           set -eux
           TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
           CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          # 매니페스트 위치에 맞게 경로 조정
-          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops apply -f k8s/
+          # 매니페스트 디렉터리 자동 탐지 (k8s/ 또는 manifests/)
+          if [ -d k8s ]; then DIR=k8s;
+          elif [ -d manifests ]; then DIR=manifests;
+          else echo "❌ 매니페스트 디렉터리를 찾지 못했어요 (k8s/ 또는 manifests/ 기대)"; exit 1; fi
+          kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops apply -f "$DIR/"
           kubectl --server="$KUBE_HOST" --token="$TOKEN" --certificate-authority="$CA" -n mlops rollout status deploy/light-serve --timeout=300s
-
