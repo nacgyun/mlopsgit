@@ -3,6 +3,14 @@ name: CI/CD
 on:
   push:
     branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
@@ -17,20 +25,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # curl 없이 동작하는 JS 액션 (Node 기반) – PATH 자동 설정
+      # kubectl 설치 (버전 고정 권장)
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: latest
+          version: v1.29.6
 
-      - name: Diagnostics (whoami/env/kubectl)
+      - name: Diagnostics
         run: |
           set -x
           whoami
           uname -a
-          which kubectl || true
           kubectl version --client
-          echo "KUBECONFIG=${KUBECONFIG:-<none>}"
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-<unset>}"
+          echo "KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-<unset>}"
           ls -l /var/run/secrets/kubernetes.io/serviceaccount || true
 
       - name: Configure in-cluster kubeconfig
@@ -45,9 +53,18 @@ jobs:
           kubectl config use-context in-cluster
           kubectl get ns "$NAMESPACE"
 
+      - name: Preflight - auth & context check
+        run: |
+          set -euo pipefail
+          kubectl config current-context
+          kubectl -n "$NAMESPACE" auth can-i get pods
+          kubectl -n "$NAMESPACE" auth can-i create configmap
+          kubectl -n "$NAMESPACE" auth can-i apply deployment || true
+
       - name: Apply manifests
         run: |
           set -euo pipefail
+          # 매니페스트 디렉토리 자동 탐색
           for d in k8s manifests kubernetes; do
             if [ -d "$d" ]; then MANIFEST_DIR="$d"; break; fi
           done
@@ -55,7 +72,17 @@ jobs:
             echo "::error::No manifest directory found (expected: k8s/ or manifests/ or kubernetes/)"
             exit 1
           fi
-          echo "Applying from $MANIFEST_DIR"
-          kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
+
+          echo "Using MANIFEST_DIR=$MANIFEST_DIR"
+          if [ -f "$MANIFEST_DIR/kustomization.yaml" ] || [ -f "$MANIFEST_DIR/kustomization.yml" ]; then
+            kubectl -n "$NAMESPACE" apply -k "$MANIFEST_DIR"
+          else
+            kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
+          fi
+
+      - name: Post - status
+        if: always()
+        run: |
           kubectl -n "$NAMESPACE" get all -o wide
+          kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -n 50
 
