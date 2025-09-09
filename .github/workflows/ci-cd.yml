@@ -3,20 +3,16 @@ name: CI/CD
 on:
   push:
     branches: [ master ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-cd-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   deploy:
     runs-on: [self-hosted, Linux, X64]
     env:
       NAMESPACE: mlops
+      # 서비스 IP(10.96.0.1) 대신 마스터 노드 API서버로 직접 연결
+      APISERVER: https://10.100.0.104:6443
+      SA_CA: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      SA_TOKEN_FILE: /var/run/secrets/kubernetes.io/serviceaccount/token
     defaults:
       run:
         shell: bash
@@ -25,46 +21,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # kubectl 설치 (버전 고정 권장)
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: v1.29.6
+          version: latest
 
-      - name: Diagnostics
+      - name: Diagnostics (whoami/env/kubectl)
         run: |
           set -x
           whoami
           uname -a
           kubectl version --client
-          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-<unset>}"
-          echo "KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-<unset>}"
+          echo "APISERVER=${APISERVER}"
           ls -l /var/run/secrets/kubernetes.io/serviceaccount || true
 
-      - name: Configure in-cluster kubeconfig
+      - name: Configure kubeconfig (direct to master API)
         run: |
           set -euo pipefail
-          API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-          SA_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-          CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-          kubectl config set-cluster in-cluster --server="$API" --certificate-authority="$CA" --embed-certs=true
-          kubectl config set-credentials sa --token="$SA_TOKEN"
-          kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace="$NAMESPACE"
+          SA_TOKEN="$(cat "$SA_TOKEN_FILE")"
+          kubectl config set-cluster in-cluster \
+            --server="${APISERVER}" \
+            --certificate-authority="${SA_CA}" \
+            --embed-certs=true
+          kubectl config set-credentials sa --token="${SA_TOKEN}"
+          kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace="${NAMESPACE}"
           kubectl config use-context in-cluster
-          kubectl get ns "$NAMESPACE"
-
-      - name: Preflight - auth & context check
-        run: |
-          set -euo pipefail
-          kubectl config current-context
-          kubectl -n "$NAMESPACE" auth can-i get pods
-          kubectl -n "$NAMESPACE" auth can-i create configmap
-          kubectl -n "$NAMESPACE" auth can-i apply deployment || true
+          # 빠른 접속 테스트
+          kubectl version
 
       - name: Apply manifests
         run: |
           set -euo pipefail
-          # 매니페스트 디렉토리 자동 탐색
           for d in k8s manifests kubernetes; do
             if [ -d "$d" ]; then MANIFEST_DIR="$d"; break; fi
           done
@@ -72,17 +59,6 @@ jobs:
             echo "::error::No manifest directory found (expected: k8s/ or manifests/ or kubernetes/)"
             exit 1
           fi
-
-          echo "Using MANIFEST_DIR=$MANIFEST_DIR"
-          if [ -f "$MANIFEST_DIR/kustomization.yaml" ] || [ -f "$MANIFEST_DIR/kustomization.yml" ]; then
-            kubectl -n "$NAMESPACE" apply -k "$MANIFEST_DIR"
-          else
-            kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
-          fi
-
-      - name: Post - status
-        if: always()
-        run: |
+          echo "Applying from $MANIFEST_DIR"
+          kubectl -n "$NAMESPACE" apply -R -f "$MANIFEST_DIR"
           kubectl -n "$NAMESPACE" get all -o wide
-          kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -n 50
-
