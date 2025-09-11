@@ -1,0 +1,17 @@
+name: SelfHosted Smoke
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  hello:
+    runs-on: [self-hosted, linux, x64, mlops, k8s]  # ëŸ¬ë„ˆ ë¼ë²¨ê³¼ ë™ì¼
+    steps:
+      - uses: actions/checkout@v4
+      - name: Say hello
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          uname -a
+          echo "It works í ¼í¾‰"
+
