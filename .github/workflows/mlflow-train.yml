@@ -1,0 +1,149 @@
+name: MLflow Train (Iris)
+
+on:
+  workflow_dispatch:
+    inputs:
+      n_estimators:
+        description: "RandomForest n_estimators"
+        required: false
+        default: "100"
+      max_depth:
+        description: "RandomForest max_depth"
+        required: false
+        default: "5"
+
+jobs:
+  train:
+    runs-on: [self-hosted, linux, x64, mlops, k8s]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) 쿠버 내부에서 kubectl 쓰도록 kubeconfig 직접 생성 + 잡 전체에 유지
+      - name: Configure kubectl (persist KUBECONFIG)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN_PATH="/var/run/secrets/kubernetes.io/serviceaccount/token"
+          CA_PATH="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+          KCFG="${RUNNER_TEMP}/kubeconfig"
+
+          unset KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT
+
+          kubectl config set-cluster in-cluster \
+            --server="https://kubernetes.default.svc:443" \
+            --certificate-authority="${CA_PATH}" \
+            --embed-certs=true \
+            --kubeconfig="${KCFG}"
+
+          kubectl config set-credentials sa \
+            --token="$(cat ${TOKEN_PATH})" \
+            --kubeconfig="${KCFG}"
+
+          kubectl config set-context in-cluster \
+            --cluster=in-cluster --user=sa \
+            --kubeconfig="${KCFG}"
+
+          kubectl config use-context in-cluster --kubeconfig="${KCFG}"
+          echo "KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
+
+          echo "== kubeconfig server =="
+          kubectl --kubeconfig="${KCFG}" config view --minify --raw | sed -n 's/ *server: *//p'
+
+      # 2) 클러스터에서 MLflow/MinIO 정보 자동 추출
+      - name: Discover MLflow & MinIO endpoints + creds (from cluster)
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          NS="mlops"
+
+          # MLflow 서비스 찾기: 우선 svc/mlflow, 없으면 라벨 탐색
+          if kubectl -n "$NS" get svc mlflow >/dev/null 2>&1; then
+            MLFLOW_URI="http://mlflow.${NS}.svc.cluster.local:5000"
+          else
+            SVC=$(kubectl -n "$NS" get svc -l app=mlflow -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "$SVC" ]; then
+              MLFLOW_URI="http://${SVC}.${NS}.svc.cluster.local:5000"
+            else
+              echo "ERROR: MLflow service not found in namespace ${NS}" >&2
+              exit 1
+            fi
+          fi
+
+          # MinIO 엔드포인트 (기본: svc/minio:9000)
+          if kubectl -n "$NS" get svc minio >/dev/null 2>&1; then
+            MLFLOW_S3_ENDPOINT_URL="http://minio.${NS}.svc.cluster.local:9000"
+          else
+            echo "WARN: svc/minio not found; defaulting to http://minio.${NS}.svc.cluster.local:9000" >&2
+            MLFLOW_S3_ENDPOINT_URL="http://minio.${NS}.svc.cluster.local:9000"
+          fi
+
+          # 크리덴셜: 우선 mlflow-s3 시크릿(AWS 키 형식) → 없으면 minio-root(root-user/root-password)
+          AWS_ACCESS_KEY_ID="minioadmin"
+          AWS_SECRET_ACCESS_KEY="minioadmin"
+
+          if kubectl -n "$NS" get secret mlflow-s3 >/dev/null 2>&1; then
+            # 시도 1: 표준 키 이름
+            AKI=$(kubectl -n "$NS" get secret mlflow-s3 -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null || true)
+            ASK=$(kubectl -n "$NS" get secret mlflow-s3 -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null || true)
+            if [ -n "$AKI" ] && [ -n "$ASK" ]; then
+              AWS_ACCESS_KEY_ID=$(echo "$AKI" | base64 -d)
+              AWS_SECRET_ACCESS_KEY=$(echo "$ASK" | base64 -d)
+            else
+              # 시도 2: accesskey/secretkey 형식
+              AKI=$(kubectl -n "$NS" get secret mlflow-s3 -o jsonpath='{.data.accesskey}' 2>/dev/null || true)
+              ASK=$(kubectl -n "$NS" get secret mlflow-s3 -o jsonpath='{.data.secretkey}' 2>/dev/null || true)
+              if [ -n "$AKI" ] && [ -n "$ASK" ]; then
+                AWS_ACCESS_KEY_ID=$(echo "$AKI" | base64 -d)
+                AWS_SECRET_ACCESS_KEY=$(echo "$ASK" | base64 -d)
+              fi
+            fi
+          fi
+
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            if kubectl -n "$NS" get secret minio-root >/dev/null 2>&1; then
+              RU=$(kubectl -n "$NS" get secret minio-root -o jsonpath='{.data.root-user}' 2>/dev/null || true)
+              RP=$(kubectl -n "$NS" get secret minio-root -o jsonpath='{.data.root-password}' 2>/dev/null || true)
+              if [ -n "$RU" ] && [ -n "$RP" ]; then
+                AWS_ACCESS_KEY_ID=$(echo "$RU" | base64 -d)
+                AWS_SECRET_ACCESS_KEY=$(echo "$RP" | base64 -d)
+              fi
+            fi
+          fi
+
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "ERROR: Could not resolve S3 credentials from 'mlflow-s3' or 'minio-root' secrets in ${NS}" >&2
+            exit 1
+          fi
+
+          {
+            echo "MLFLOW_TRACKING_URI=$MLFLOW_URI"
+            echo "MLFLOW_S3_ENDPOINT_URL=$MLFLOW_S3_ENDPOINT_URL"
+            echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"
+            echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
+            echo "AWS_DEFAULT_REGION=us-east-1"
+          } >> "$GITHUB_ENV"
+
+          echo "Resolved:"
+          echo "  MLFLOW_TRACKING_URI=$MLFLOW_URI"
+          echo "  MLFLOW_S3_ENDPOINT_URL=$MLFLOW_S3_ENDPOINT_URL"
+
+      # 3) 파이썬 venv로 의존성 설치 후 학습 실행 (MLflow 로깅)
+      - name: Train (log to MLflow)
+        shell: bash
+        env:
+          N_ESTIMATORS: ${{ github.event.inputs.n_estimators }}
+          MAX_DEPTH:    ${{ github.event.inputs.max_depth }}
+        run: |
+          set -euo pipefail
+          python3 -V || (sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip)
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install mlflow scikit-learn
+
+          python ml/train.py
+
+      - name: Done
+        run: echo "���� Training finished and logged to MLflow"
