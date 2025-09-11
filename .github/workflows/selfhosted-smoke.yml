@@ -10,24 +10,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure in-cluster kubectl   # ← 여기 추가
+# .github/workflows/selfhosted-smoke.yml 의 kubectl 세팅 스텝을 아래로 교체
+        - name: Configure in-cluster kubectl (force DNS)
         run: |
-          set -euo pipefail
-          SVC_HOST="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
-          SVC_PORT="${KUBERNETES_SERVICE_PORT:-443}"
+        set -euo pipefail
 
-          TOKEN_PATH="/var/run/secrets/kubernetes.io/serviceaccount/token"
-          CA_PATH="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    # SA 토큰/CA (Pod에 자동 마운트됨)
+        TOKEN_PATH="/var/run/secrets/kubernetes.io/serviceaccount/token"
+        CA_PATH="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-          kubectl config set-cluster in-cluster \
-            --server="https://${SVC_HOST}:${SVC_PORT}" \
-            --certificate-authority="${CA_PATH}"
-          kubectl config set-credentials sa --token="$(cat ${TOKEN_PATH})"
-          kubectl config set-context in-cluster --cluster=in-cluster --user=sa
-          kubectl config use-context in-cluster
+    # ❗환경변수 무시하고, DNS로 강제 지정
+        SVC_HOST="kubernetes.default.svc"
+        SVC_PORT="443"
 
-          kubectl version --short
+         kubectl config set-cluster in-cluster \
+         --server="https://${SVC_HOST}:${SVC_PORT}" \
+         --certificate-authority="${CA_PATH}" \
+         --embed-certs=true
 
+        kubectl config set-credentials sa --token="$(cat ${TOKEN_PATH})"
+         kubectl config set-context in-cluster --cluster=in-cluster --user=sa
+        kubectl config use-context in-cluster
+
+    # 연결 점검(5초 타임아웃으로 빠르게 실패)
+         kubectl version --short --request-timeout=5s
+        kubectl get ns --request-timeout=5s
+        
       - name: Test kubectl
         run: |
           kubectl get pods -A
