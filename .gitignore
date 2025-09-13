@@ -1,0 +1,16 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn*.log*
+pnpm-debug.log*
+.cache/
+dist/
+build/
+.next/
+out/
+coverage/
+
+# Env & misc
+.env
+.env.*
+.DS_Store
