@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: mlflow-train-job-
+  namespace: mlops
+  labels:
+    app: mlflow-train
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mlflow-train
+    spec:
+      serviceAccountName: gh-runner-sa
+      restartPolicy: Never
+      containers:
+      - name: train
+        image: ghcr.io/nacgyun/mlopsgit/mlflow-train:latest   # ← GHCR 경로
+        imagePullPolicy: Always
+        command: ["python"]
+        args: ["/app/train.py"]
+        env:
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow.mlops.svc.cluster.local:5000
+        - name: MLFLOW_S3_ENDPOINT_URL
+          value: http://minio.mlops.svc.cluster.local:9000
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-root
+              key: root-user
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-root
+              key: root-password
+        - name: AWS_DEFAULT_REGION
+          value: us-east-1
+        - name: N_ESTIMATORS
+          value: "100"
+        - name: MAX_DEPTH
+          value: "5"
+

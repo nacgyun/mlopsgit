@@ -1,0 +1,60 @@
+name: Train (Kubernetes Job)
+
+on:
+  push:
+    paths:
+      - 'ml/train.py'
+      - 'k8s/job.yaml'
+      - '.github/workflows/train.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: read   # (이미지 풀만 하면 read면 충분)
+
+jobs:
+  run:
+    runs-on: [self-hosted, linux, x64]   # 네 클러스터 안의 GH Runner 라벨
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) train.py -> ConfigMap 갱신
+      - name: Apply ConfigMap (train.py)
+        run: |
+          kubectl -n mlops create configmap train-script \
+            --from-file=ml/train.py \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # 2) Job 생성 (generateName이라 매번 새로 생김)
+      - name: Create Job from YAML
+        id: start
+        run: |
+          NAME=$(kubectl -n mlops create -f k8s/job.yaml -o name | cut -d/ -f2)
+          echo "job=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Created job: ${NAME}"
+
+      # 3) 로그 스트림 (kubectl이 job 단위 로그를 지원하면 이대로, 안되면 Pod 이름으로)
+      - name: Stream logs
+        run: |
+          if kubectl -n mlops logs job/${{ steps.start.outputs.job }} -c train --tail=10 >/dev/null 2>&1; then
+            kubectl -n mlops logs -f job/${{ steps.start.outputs.job }} -c train
+          else
+            POD=$(kubectl -n mlops get pods -l job-name=${{ steps.start.outputs.job }} \
+              -o jsonpath='{.items[0].metadata.name}')
+            kubectl -n mlops logs -f "$POD" -c train
+          fi
+
+      # 4) 완료 대기
+      - name: Wait for completion
+        run: |
+          kubectl -n mlops wait --for=condition=complete job/${{ steps.start.outputs.job }} --timeout=30m
+
+      # 실패 시 디버그 정보
+      - name: Debug on failure
+        if: ${{ failure() }}
+        run: |
+          kubectl -n mlops describe job/${{ steps.start.outputs.job }} || true
+          POD=$(kubectl -n mlops get pods -l job-name=${{ steps.start.outputs.job }} \
+            -o jsonpath='{.items[0].metadata.name}') || true
+          kubectl -n mlops describe pod "$POD" || true
+

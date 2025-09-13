@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: mlops
+  generateName: mlflow-train-job-   # 매 실행마다 다른 이름
+spec:
+  ttlSecondsAfterFinished: 600       # 10분 뒤 Completed 리소스 자동 청소
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: gh-runner-sa
+      restartPolicy: Never
+      containers:
+      - name: train
+        image: ghcr.io/nacgyun/mlflow-train:latest   # 네 GHCR 이미지
+        imagePullPolicy: Always
+        command: ["python"]
+        args: ["-u", "/app/train.py"]                # 로그 버퍼링 방지
+        env:
+        - { name: PYTHONUNBUFFERED, value: "1" }
+        - { name: MLFLOW_TRACKING_URI,    value: "http://mlflow.mlops.svc.cluster.local:5000" }
+        - { name: MLFLOW_S3_ENDPOINT_URL, value: "http://minio.mlops.svc.cluster.local:9000" }
+        - { name: AWS_S3_FORCE_PATH_STYLE, value: "true" }
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: minio-root, key: root-user } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: minio-root, key: root-password } }
+        - { name: AWS_DEFAULT_REGION, value: "us-east-1" }
+        # 학습시간 조절 (대략 1분)
+        - { name: EPOCHS,   value: "60" }
+        - { name: STEP_SEC, value: "1"  }
+        - { name: ALPHA,    value: "0.0001" }
+        volumeMounts:
+        - { name: train-src, mountPath: /app }
+      volumes:
+      - name: train-src
+        configMap: { name: train-script }            # train.py를 ConfigMap으로 마운트
+
