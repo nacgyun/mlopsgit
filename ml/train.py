@@ -65,5 +65,5 @@ with mlflow.start_run():
     # 모델 로깅 (logged_model=False 로 fallback)
     mlflow.sklearn.log_model(clf, "model", registered_model_name=None)
 
-    print(f"✅ Train done: acc={acc:.3f}, f1={f1:.3f}, time={train_time:.2f}s")
+    print(f"✅ !Train done: acc={acc:.3f}, f1={f1:.3f}, time={train_time:.2f}s")
 
