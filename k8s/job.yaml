@@ -1,40 +1,47 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: mlflow-train-      # 매 푸시마다 유니크 이름
-  labels:
-    app: mlflow-train
+  name: mlflow-train-job
+  namespace: mlops
 spec:
-  ttlSecondsAfterFinished: 600     # 완료 10분 뒤 자동 청소
   backoffLimit: 0
+  ttlSecondsAfterFinished: 600
   template:
-    metadata:
-      labels:
-        app: mlflow-train
     spec:
       serviceAccountName: gh-runner-sa
       restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
       containers:
       - name: train
-        image: ghcr.io/nacgyun/mlflow-train:latest
+        image: ghcr.io/nacgyun/mlflow-train:latest   # 워크플로우에서 빌드한 이미지
         imagePullPolicy: Always
         command: ["python"]
         args: ["-u", "/app/train.py"]
         env:
-        - { name: PYTHONUNBUFFERED, value: "1" }
-        - { name: MLFLOW_TRACKING_URI,    value: "http://mlflow.mlops.svc.cluster.local:5000" }
-        - { name: MLFLOW_S3_ENDPOINT_URL, value: "http://minio.mlops.svc.cluster.local:9000" }
-        - { name: AWS_S3_FORCE_PATH_STYLE, value: "true" }
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow.mlops.svc.cluster.local:5000
+        - name: MLFLOW_S3_ENDPOINT_URL
+          value: http://minio.mlops.svc.cluster.local:9000
+        - name: AWS_S3_FORCE_PATH_STYLE
+          value: "true"
         - name: AWS_ACCESS_KEY_ID
           valueFrom: { secretKeyRef: { name: minio-root, key: root-user } }
         - name: AWS_SECRET_ACCESS_KEY
           valueFrom: { secretKeyRef: { name: minio-root, key: root-password } }
-        - { name: AWS_DEFAULT_REGION, value: "us-east-1" }
-        - { name: N_ESTIMATORS, value: "100" }
-        - { name: MAX_DEPTH,    value: "5" }
+        - name: AWS_DEFAULT_REGION
+          value: us-east-1
+        - name: N_ESTIMATORS
+          value: "100"
+        - name: MAX_DEPTH
+          value: "5"
         volumeMounts:
-        - { name: train-src, mountPath: /app }
+        - name: train-src
+          mountPath: /app
       volumes:
       - name: train-src
-        configMap: { name: train-script }
+        configMap:
+          name: train-script
 
