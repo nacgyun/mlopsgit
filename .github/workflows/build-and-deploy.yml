@@ -1,0 +1,64 @@
+name: Build & Deploy (GHCR → K8s)
+
+on:
+  push:
+    branches: [ master ]   # 너 브랜치
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/nacgyun/mlflow-train:latest
+  NAMESPACE: mlops
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: nacgyun
+          password: ${{ secrets.GHCR_PAT }}   # write:packages 포함된 PAT
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ml/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}
+
+  deploy:
+    needs: build
+    runs-on: self-hosted          # 클러스터 안 GH 러너
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: kubectl 설정 (in-cluster SA 사용)
+        run: |
+          set -euo pipefail
+          K=https://kubernetes.default.svc
+          kubectl config set-cluster in --server="$K" \
+            --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --embed-certs=true
+          kubectl config set-credentials sa --token=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          kubectl config set-context in --cluster=in --user=sa --namespace=${{ env.NAMESPACE }}
+          kubectl config use-context in
+          kubectl auth can-i create jobs
+
+      - name: train-script ConfigMap 업데이트
+        run: |
+          kubectl -n ${{ env.NAMESPACE }} create configmap train-script \
+            --from-file=ml/train.py --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Job 생성 (항상 새 이름)
+        run: |
+          kubectl -n ${{ env.NAMESPACE }} create -f k8s/job.yaml
+
+      - name: 최신 Job/Pod 보기
+        run: |
+          LATEST=$(kubectl -n ${{ env.NAMESPACE }} get jobs --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].0.metadata.name}')
+          echo "LATEST JOB: $LATEST"
+          kubectl -n ${{ env.NAMESPACE }} get pods -l job-name=$LATEST
+
