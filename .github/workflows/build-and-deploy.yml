@@ -44,16 +44,7 @@ jobs:
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      # 4) yq 설치 (set image 방식 쓰지만, 필요시 대비)
-      - name: Install yq
-        run: |
-          set -e
-          curl -Ls -o "$RUNNER_TEMP/yq" https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          chmod +x "$RUNNER_TEMP/yq"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-          yq --version
-
-      # 5) GHCR 푸시용 도커 시크릿 (Kaniko가 /kaniko/.docker/config.json 사용)
+      # 4) GHCR 푸시용 도커 시크릿 (Kaniko가 /kaniko/.docker/config.json 사용)
       - name: Ensure GHCR docker secret
         run: |
           kubectl -n "$NAMESPACE" create secret docker-registry ghcr-creds \
@@ -63,16 +54,16 @@ jobs:
             --docker-email="ci@example.local" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # 6) 이전 Kaniko Job 정리
+      # 5) 이전 Kaniko Job 정리
       - name: Cleanup previous Kaniko Job
         run: kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 7) Kaniko Job 실행 (레포의 현재 커밋 SHA 컨텍스트로 빌드 → GHCR 푸시)
+      # 6) Kaniko Job 실행 (envsubst 제거, 셸 확장 사용)
       - name: Launch Kaniko Job
         env:
           GIT_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git#${{ github.sha }}
         run: |
-          cat <<'YAML' | envsubst | kubectl -n "$NAMESPACE" apply -f -
+          cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -89,7 +80,6 @@ jobs:
                       - --context=${GIT_URL}
                       - --dockerfile=Dockerfile
                       - --destination=${IMAGE}
-                      # 캐시를 쓰려면 주석 해제
                       # - --cache=true
                       # - --cache-repo=${IMAGE_REPO}-cache
                     volumeMounts:
@@ -102,9 +92,9 @@ jobs:
                       items:
                         - key: .dockerconfigjson
                           path: config.json
-          YAML
+          EOF
 
-      # 8) Kaniko 완료 대기 + 로그 출력
+      # 7) Kaniko 완료 대기 + 로그 출력
       - name: Wait for Kaniko build to finish
         run: |
           set -e
@@ -113,7 +103,7 @@ jobs:
           echo "== Kaniko Logs =="
           kubectl -n "$NAMESPACE" logs "$POD"
 
-      # 9) 매니페스트 적용 후 이미지 태그 갱신
+      # 8) 배포 적용 및 이미지 태그 갱신
       - name: Set image and rollout
         run: |
           set -e
