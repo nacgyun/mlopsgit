@@ -10,7 +10,7 @@ permissions:
 
 env:
   NAMESPACE: mlops
-  APP_NAME: myapp                          # Deployment 이름(컨테이너 이름도 동일 가정)
+  APP_NAME: myapp
   IMAGE_REPO: ghcr.io/${{ github.repository }}
   IMAGE_TAG: ${{ github.sha }}
   IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
@@ -21,30 +21,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # kubectl 설치 (sudo 불필요)
+      # 1) kubectl 설치 (이 스텝에서는 실행하지 않음! 다음 스텝부터 PATH 반영됨)
       - name: Install kubectl (no-sudo)
         run: |
           set -e
           ver=$(curl -Ls https://dl.k8s.io/release/stable.txt)
-          curl -Ls -o $RUNNER_TEMP/kubectl https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl
-          chmod +x $RUNNER_TEMP/kubectl
+          curl -Ls -o "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl"
+          chmod +x "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-          kubectl version --client --short
 
-      # kubeconfig 주입 (리포지토리 시크릿에 KUBECONFIG 넣어둬야 함)
-      - name: Configure kube access
+      # 2) kubeconfig 주입 + 클러스터 확인
+      - name: Configure kube access & verify
         run: |
           set -e
-          echo "${{ secrets.KUBECONFIG }}" > $RUNNER_TEMP/kubeconfig
-          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> $GITHUB_ENV
+          echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
           kubectl version --short
-          kubectl get ns
+          kubectl get ns || true
 
-      # 네임스페이스 없으면 생성
+      # 3) 네임스페이스 없으면 생성
       - name: Ensure namespace exists
-        run: kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
+        run: |
+          kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      # GHCR 푸시용 도커 시크릿 준비 (Kaniko가 /kaniko/.docker/config.json 으로 사용)
+      # 4) yq 설치 (아래에서 set image 교체용으로 사용)
+      - name: Install yq
+        run: |
+          set -e
+          curl -Ls -o "$RUNNER_TEMP/yq" https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          yq --version
+
+      # 5) GHCR 로그인 Secret (Kaniko가 /kaniko/.docker/config.json 으로 사용)
       - name: Ensure GHCR docker secret
         run: |
           kubectl -n "$NAMESPACE" create secret docker-registry ghcr-creds \
@@ -54,11 +63,11 @@ jobs:
             --docker-email="ci@example.local" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # 이전 Kaniko Job 정리
+      # 6) 이전 Kaniko Job 정리
       - name: Cleanup previous Kaniko Job
         run: kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # Kaniko Job 실행 (Git 커밋 SHA 컨텍스트로 빌드 → GHCR 푸시)
+      # 7) Kaniko Job 실행 (레포의 현재 커밋 SHA 컨텍스트로 빌드 → GHCR 푸시)
       - name: Launch Kaniko Job
         env:
           GIT_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git#${{ github.sha }}
@@ -80,7 +89,7 @@ jobs:
                       - --context=${GIT_URL}
                       - --dockerfile=Dockerfile
                       - --destination=${IMAGE}
-                      # 캐시 쓰고 싶으면 주석 해제
+                      # 캐시를 쓰고 싶으면 주석 해제
                       # - --cache=true
                       # - --cache-repo=${IMAGE_REPO}-cache
                     volumeMounts:
@@ -95,7 +104,7 @@ jobs:
                           path: config.json
           YAML
 
-      # Kaniko 완료 대기 + 로그 출력
+      # 8) Kaniko 완료 대기 + 로그 출력
       - name: Wait for Kaniko build to finish
         run: |
           set -e
@@ -104,16 +113,18 @@ jobs:
           echo "== Kaniko Logs =="
           kubectl -n "$NAMESPACE" logs "$POD"
 
-      # 배포 적용: 기존 매니페스트 적용 후 이미지 태그만 교체
-      - name: Apply manifests
-        run: |
-          set -e
-          # 네 레포의 배포 매니페스트 경로에 맞게 수정
-          kubectl -n "$NAMESPACE" apply -f k8s/deploy.yaml
+      # 9) 매니페스트 적용 후 이미지 태그 갱신(두 방법 중 하나 택1)
+      # 방법 A: 매니페스트 이미지 교체 후 apply
+      # - name: Update image in manifest and apply
+      #   run: |
+      #     yq -i '.spec.template.spec.containers[0].image = strenv(IMAGE)' k8s/deploy.yaml
+      #     kubectl -n "$NAMESPACE" apply -f k8s/deploy.yaml
 
-      - name: Update image to new tag
+      # 방법 B: set image로 교체(여기서는 B 사용)
+      - name: Set image and rollout
         run: |
           set -e
+          kubectl -n "$NAMESPACE" apply -f k8s/deploy.yaml
           kubectl -n "$NAMESPACE" set image deploy/${APP_NAME} ${APP_NAME}=${IMAGE} --record
           kubectl -n "$NAMESPACE" rollout status deploy/${APP_NAME} --timeout=5m
 
