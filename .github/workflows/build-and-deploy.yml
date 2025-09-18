@@ -59,7 +59,7 @@ jobs:
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (initContainer로 git clone → 로컬 컨텍스트 빌드)
+      # 6) Kaniko Job 실행 (initContainer: 소스 아카이브 다운로드 → /workspace 에 압축 해제)
       - name: Launch Kaniko Job
         env:
           REPO: ${{ github.repository }}   # owner/repo
@@ -77,19 +77,27 @@ jobs:
                 restartPolicy: Never
                 initContainers:
                   - name: fetch-src
-                    image: alpine/git:2.45.2
+                    image: alpine:3.20
                     env:
-                      - name: GIT_URL
-                        value: "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${REPO}.git"
+                      - name: REPO
+                        value: "${REPO}"
+                      - name: REV
+                        value: "${REV}"
+                      - name: GITHUB_TOKEN
+                        value: "${{ secrets.GITHUB_TOKEN }}"
                     command: ["/bin/sh","-lc"]
                     args:
                       - |
                         set -e
-                        git config --global advice.detachedHead false
-                        git clone --no-tags --depth 1 "$GIT_URL" /workspace
-                        cd /workspace
-                        git fetch origin "${REV}" --depth=1 || true
-                        git checkout "${REV}" || true
+                        apk add --no-cache curl tar
+                        mkdir -p /workspace
+                        # GitHub API 아카이브 다운로드 (private repo 지원, 토큰 헤더)
+                        echo ">> downloading source archive ..."
+                        curl -Ls -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                          -o /tmp/src.tgz "https://api.github.com/repos/${REPO}/tarball/${REV}"
+                        echo ">> extracting ..."
+                        tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
+                        ls -lah /workspace | head -n 50
                     volumeMounts:
                       - name: workspace
                         mountPath: /workspace
