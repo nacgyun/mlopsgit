@@ -59,7 +59,7 @@ jobs:
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (init: 외부 네트워크 X → /workspace/.ready가 생길 때까지 대기)
+      # 6) Kaniko Job 실행 (init: 외부 네트워크 X → /workspace/.ready 기다림)
       - name: Launch Kaniko Job
         run: |
           cat <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
@@ -116,24 +116,24 @@ jobs:
       - name: Copy source into pod & release init
         run: |
           set -e
-          # 파드가 생성될 때까지 대기
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && break
             sleep 2
           done
           echo "POD=$POD"
-          # 워크스페이스 전체를 init 컨테이너에 복사
           kubectl -n "$NAMESPACE" cp "$GITHUB_WORKSPACE/." "$POD":/workspace -c fetch-src
-          # .ready 파일 생성 → init 종료, kaniko 시작
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'touch /workspace/.ready; ls -lah /workspace | head -n 50'
 
-      # 8) (선택) 실시간 로그 스트리밍
-      - name: Stream Kaniko logs (live)
+      # 8) 스트리밍 로그 (best-effort: 실패 무시)
+      - name: Stream Kaniko logs (best-effort)
         run: |
-          set -e
+          set +e
           POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "$NAMESPACE" logs -f "$POD" -c kaniko & sleep 5 || true
+          # 스트리밍 에러가 나도 실패 처리하지 않도록 --ignore-errors + || true
+          kubectl -n "$NAMESPACE" logs -f "$POD" -c kaniko --ignore-errors=true 2>&1 | sed -u 's/^/[kaniko] /' &
+          sleep 5
+          exit 0
 
       # 9) Kaniko 완료 대기 + 실패시 진단 로그
       - name: Wait for Kaniko build to finish (with diagnostics)
