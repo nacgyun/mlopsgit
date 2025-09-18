@@ -1,17 +1,28 @@
-FROM python:3.10-slim
+# syntax=docker/dockerfile:1.6
 
-# scikit-learn 실행에 필요한 libgomp1만 추가
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
- && rm -rf /var/lib/apt/lists/*
+FROM python:3.10-slim AS runtime
 
-# pip 최신화 + 필요한 패키지 설치 (버전은 예시, 고정 추천)
-RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir \
-      mlflow==2.14.3 \
-      scikit-learn==1.4.2 \
-      boto3==1.34.131 \
-      pandas==2.2.2
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
-# 실제 /app/train.py 는 K8s에서 ConfigMap으로 마운트하므로 여기서 복사할 필요 없음
-CMD ["bash","-lc","python /app/train.py"]
+
+# (필요시) 빌드 도구
+# RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc && rm -rf /var/lib/apt/lists/*
+
+# 1) 의존성만 먼저 복사 → 이 레이어는 requirements가 바뀔 때만 다시 빌드
+COPY ml/requirements.txt /tmp/requirements.txt
+
+# 2) pip 설치 (BuildKit 캐시 활용)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip && \
+    pip install -r /tmp/requirements.txt
+
+# 3) 애플리케이션 코드는 마지막에
+COPY ml/ /app/
+
+# (필요시) 기본 실험/엔드포인트 환경변수
+ENV MLFLOW_EXPERIMENT_NAME=iris-rf
+
+CMD ["python","-u","/app/train.py"]
+
