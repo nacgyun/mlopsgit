@@ -1,9 +1,0 @@
-name: Self-Hosted Runner Check
-on: workflow_dispatch
-jobs:
-  ping:
-    runs-on: [self-hosted, mlops, k8s]
-    steps:
-      - uses: actions/checkout@v4
-      - run: echo "Hello from $(uname -a)"
-
