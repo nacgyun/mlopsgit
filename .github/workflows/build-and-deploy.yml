@@ -62,7 +62,7 @@ jobs:
       # 6) Kaniko Job 실행 (외부 egress 없어도 동작: runner가 소스 넣을 때까지 대기)
       - name: Launch Kaniko Job
         run: |
-          cat <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
+          cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -76,12 +76,13 @@ jobs:
                   - name: fetch-src
                     image: alpine:3.20
                     command: ["/bin/sh","-lc"]
-                    args: |
-                      set -e
-                      mkdir -p /workspace
-                      echo ">> waiting for /workspace/.ready ..."
-                      while [ ! -f /workspace/.ready ]; do sleep 1; done
-                      echo ">> ready, init exit"
+                    args:
+                      - |
+                        set -e
+                        mkdir -p /workspace
+                        echo ">> waiting for /workspace/.ready ..."
+                        while [ ! -f /workspace/.ready ]; do sleep 1; done
+                        echo ">> ready, init exit"
                     volumeMounts:
                       - name: workspace
                         mountPath: /workspace
