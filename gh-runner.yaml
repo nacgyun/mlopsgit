@@ -2,72 +2,47 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gh-runner
-  namespace: mlops
-  labels: { app: gh-runner }
+  labels:
+    app: gh-runner
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: gh-runner }
+    matchLabels:
+      app: gh-runner
   template:
     metadata:
-      labels: { app: gh-runner }
+      labels:
+        app: gh-runner
     spec:
-      terminationGracePeriodSeconds: 30
+      serviceAccountName: gh-runner-sa
+      # GHCR 프라이빗 이미지가 필요하면 비밀키를 붙이세요(없으면 삭제해도 됨)
+      imagePullSecrets:
+      - name: ghcr-pull
       containers:
-        - name: runner
-          image: ghcr.io/actions/actions-runner:latest
-          imagePullPolicy: IfNotPresent
-          workingDir: /home/runner    # ← 이미지 내 러너 위치만 사용
-          env:
-            - name: GH_OWNER
-              valueFrom: { secretKeyRef: { name: gh-runner-secret, key: GH_OWNER } }
-            - name: GH_REPO
-              valueFrom: { secretKeyRef: { name: gh-runner-secret, key: GH_REPO } }
-            - name: GH_PAT
-              valueFrom: { secretKeyRef: { name: gh-runner-secret, key: GH_PAT } }
-            - name: RUNNER_LABELS
-              value: "self-hosted,linux,x64,mlops,k8s"
-            - name: RUNNER_WORKDIR
-              value: "_work"
-          command: ["/bin/bash","-lc"]
-          args:
-            - |
-              set -euo pipefail
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        env:
+        - name: RUNNER_REPO_URL
+          value: "https://github.com/nacgyun/mlopsgit"
+        - name: RUNNER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: gh-runner-secret
+              key: token
+        - name: RUNNER_LABELS
+          value: "self-hosted,linux,x64,mlops,k8s"
+        command: ["/bin/bash","-lc"]
+        args:
+        - |
+          set -euo pipefail
+          cd /home/runner
+          ./config.sh \
+            --url "$RUNNER_REPO_URL" \
+            --token "$RUNNER_TOKEN" \
+            --name "$HOSTNAME" \
+            --labels "$RUNNER_LABELS" \
+            --unattended \
+            --ephemeral \
+            --work _work
+          exec ./run.sh
 
-              GH_URL="https://github.com/${GH_OWNER}/${GH_REPO}"
-              API_BASE="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}"
-
-              echo "[*] Getting registration token..."
-              TOKEN="$(curl -fsSL -X POST \
-                -H "Authorization: Bearer ${GH_PAT}" \
-                -H "Accept: application/vnd.github+json" \
-                "${API_BASE}/actions/runners/registration-token" | jq -r .token)"
-              [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "failed to get token"; exit 1; }
-
-              RUNNER_NAME="${HOSTNAME}"
-              echo "[*] Configuring runner at /home/runner (name=${RUNNER_NAME})"
-              /home/runner/config.sh \
-                --unattended \
-                --url "${GH_URL}" \
-                --token "${TOKEN}" \
-                --name "${RUNNER_NAME}" \
-                --labels "${RUNNER_LABELS}" \
-                --work "${RUNNER_WORKDIR}"
-
-              cleanup() {
-                echo "[*] Deregister runner: ${RUNNER_NAME}"
-                REMOVE_TOKEN="$(curl -fsSL -X POST \
-                  -H "Authorization: Bearer ${GH_PAT}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${API_BASE}/actions/runners/remove-token" | jq -r .token || true)"
-                if [ -n "${REMOVE_TOKEN:-}" ] && [ "${REMOVE_TOKEN}" != "null" ]; then
-                  /home/runner/config.sh remove --unattended --token "${REMOVE_TOKEN}" || true
-                fi
-              }
-              trap cleanup EXIT
-
-              echo "[*] Starting listener..."
-              exec /home/runner/run.sh
-          resources:
-            requests: { cpu: "250m", memory: "512Mi" }
-            limits:   { cpu: "1",    memory: "1Gi" }

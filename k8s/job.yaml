@@ -1,47 +1,56 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mlflow-train-job
+  generateName: mlflow-train-          # 실행할 때마다 고유한 이름으로 생성
   namespace: mlops
+  labels:
+    app: mlflow-train
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 600
+  ttlSecondsAfterFinished: 1800         # 완료 후 30분 뒤 가비지 컬렉션
   template:
+    metadata:
+      labels:
+        app: mlflow-train
     spec:
       serviceAccountName: gh-runner-sa
       restartPolicy: Never
       imagePullSecrets:
-        - name: ghcr-pull
+        - name: ghcr-pull               # GHCR 프라이빗이면 필요
+
       containers:
-      - name: train
-        image: ghcr.io/nacgyun/mlflow-train:latest   # 워크플로우에서 빌드한 이미지
-        imagePullPolicy: Always
-        command: ["python"]
-        args: ["-u", "/app/train.py"]
-        env:
-        - name: PYTHONUNBUFFERED
-          value: "1"
-        - name: MLFLOW_TRACKING_URI
-          value: http://mlflow.mlops.svc.cluster.local:5000
-        - name: MLFLOW_S3_ENDPOINT_URL
-          value: http://minio.mlops.svc.cluster.local:9000
-        - name: AWS_S3_FORCE_PATH_STYLE
-          value: "true"
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom: { secretKeyRef: { name: minio-root, key: root-user } }
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom: { secretKeyRef: { name: minio-root, key: root-password } }
-        - name: AWS_DEFAULT_REGION
-          value: us-east-1
-        - name: N_ESTIMATORS
-          value: "100"
-        - name: MAX_DEPTH
-          value: "5"
-        volumeMounts:
-        - name: train-src
-          mountPath: /app
-      volumes:
-      - name: train-src
-        configMap:
-          name: train-script
+        - name: train
+          image: ghcr.io/nacgyun/mlflow-train:latest
+          imagePullPolicy: Always
+
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.mlops.svc.cluster.local:5000"
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "http://minio.mlops.svc.cluster.local:9000"
+            - name: AWS_S3_FORCE_PATH_STYLE
+              value: "true"
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-1"
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: "demo-exp"
+
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-root
+                  key: root-user
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-root
+                  key: root-password
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
 
