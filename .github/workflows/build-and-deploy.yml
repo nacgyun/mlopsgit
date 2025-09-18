@@ -1,98 +1,82 @@
-name: Build & Deploy (GHCR → K8s)
+name: Build & Deploy ML Train Job
 
 on:
   push:
-    branches: [ master ]
     paths:
-      - 'ml/**'
-      - 'k8s/**'
-      - '.github/workflows/build-and-deploy.yml'
+      - "ml/**"
+      - "job.yaml"
+      - ".github/workflows/build-and-deploy.yml"
   workflow_dispatch:
-
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: build-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/mlflow-train:latest
+  IMAGE_BASE: ghcr.io/nacgyun/mlflow-train
   NAMESPACE: mlops
   JOB_NAME: mlflow-train-job
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-and-deploy:
+    runs-on: [self-hosted, linux, x64]
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}   # packages:write 권한 필요
 
-      - name: Build & Push
+      - name: Build & Push (with registry cache)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ml/Dockerfile
-          platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE }}
-            ${{ env.IMAGE }}-${{ github.sha }}
+            ${{ env.IMAGE_BASE }}:${{ github.sha }}
+            ${{ env.IMAGE_BASE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE_BASE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_BASE }}:buildcache,mode=max
 
-  deploy:
-    needs: build
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-
-      # (선택) kubectl이 없다면 활성화
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: 'latest'
-
-      # 클러스터 접근: self-hosted 러너가 이미 KUBECONFIG를 갖고 있다면 아래 단계 불필요
-      # - name: Write kubeconfig from secret
-      #   if: env.KUBE_CONFIG_DATA != ''
-      #   env:
-      #     KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
-      #   run: |
-      #     mkdir -p ~/.kube
-      #     echo "$KUBE_CONFIG_DATA" | base64 -d > ~/.kube/config
-
-      - name: Update train-script ConfigMap from repo
+      - name: Set image tag env
         run: |
-          kubectl -n $NAMESPACE create configmap train-script \
-            --from-file=train.py=ml/train.py \
-            -o yaml --dry-run=client | kubectl apply -f -
+          echo "IMAGE_SHA=${IMAGE_BASE}:${GITHUB_SHA}" >> "$GITHUB_ENV"
 
-      - name: Apply Job manifest
-        env:
-          IMAGE: ${{ env.IMAGE }}
+      - name: Show kubectl context (debug)
         run: |
-          # 이전 잡 제거(고정 이름 방식)
-          kubectl -n $NAMESPACE delete job $JOB_NAME --ignore-not-found
-          # 매니페스트 적용
-          kubectl -n $NAMESPACE apply -f k8s/job.yaml
+          kubectl version --short || true
+          kubectl get ns || true
+          kubectl -n "${NAMESPACE}" get svc || true
 
-      - name: Wait for Job to complete (10m)
+      - name: Deploy Job (delete → apply with image SHA)
         run: |
-          kubectl -n $NAMESPACE wait --for=condition=complete job/$JOB_NAME --timeout=600s || {
-            echo "::error::Job failed or timed out. Showing logs…"
-            kubectl -n $NAMESPACE logs -l job-name=$JOB_NAME --all-containers --tail=-1 || true
-            kubectl -n $NAMESPACE describe job/$JOB_NAME || true
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" delete job "${JOB_NAME}" --ignore-not-found
+          # __IMAGE__ 자리표시자를 SHA 태그로 치환해서 적용
+          sed "s|__IMAGE__|${IMAGE_SHA}|g" job.yaml | kubectl -n "${NAMESPACE}" apply -f -
+
+      - name: Wait for completion & show logs
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" wait --for=condition=complete job/"${JOB_NAME}" --timeout=900s || {
+            echo "== Describe Job =="; kubectl -n "${NAMESPACE}" describe job "${JOB_NAME}" || true
+            echo "== Pods =="; kubectl -n "${NAMESPACE}" get pods -l job-name="${JOB_NAME}" -o wide || true
+            echo "== Pod Describes =="; for p in $(kubectl -n "${NAMESPACE}" get pods -l job-name="${JOB_NAME}" -o jsonpath='{.items[*].metadata.name}'); do kubectl -n "${NAMESPACE}" describe pod "$p" || true; done
+            echo "== Pod Logs =="; kubectl -n "${NAMESPACE}" logs job/"${JOB_NAME}" --all-containers=true --tail=-1 || true
             exit 1
           }
-
-      - name: Print logs
-        if: always()
-        run: |
-          kubectl -n $NAMESPACE logs -l job-name=$JOB_NAME --all-containers --tail=-1 || true
+          kubectl -n "${NAMESPACE}" logs job/"${JOB_NAME}" --all-containers=true --tail=200
 
