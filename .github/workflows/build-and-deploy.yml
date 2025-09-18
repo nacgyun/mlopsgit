@@ -59,7 +59,7 @@ jobs:
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (init: 외부 네트워크 X → /workspace/.ready 기다림)
+      # 6) Kaniko Job 실행 (외부 egress 없어도 동작: runner가 소스 넣을 때까지 대기)
       - name: Launch Kaniko Job
         run: |
           cat <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
@@ -76,13 +76,12 @@ jobs:
                   - name: fetch-src
                     image: alpine:3.20
                     command: ["/bin/sh","-lc"]
-                    args:
-                      - |
-                        set -e
-                        mkdir -p /workspace
-                        echo ">> waiting for /workspace/.ready ..."
-                        while [ ! -f /workspace/.ready ]; do sleep 1; done
-                        echo ">> ready, init exit"
+                    args: |
+                      set -e
+                      mkdir -p /workspace
+                      echo ">> waiting for /workspace/.ready ..."
+                      while [ ! -f /workspace/.ready ]; do sleep 1; done
+                      echo ">> ready, init exit"
                     volumeMounts:
                       - name: workspace
                         mountPath: /workspace
@@ -93,7 +92,7 @@ jobs:
                       - --context=/workspace
                       - --dockerfile=/workspace/Dockerfile
                       - --destination=${IMAGE}
-                      # 캐시 사용 원하면 아래 주석 해제
+                      # 캐시 원하면 아래 주석 해제
                       # - --cache=true
                       # - --cache-repo=${IMAGE_REPO}-cache
                     volumeMounts:
@@ -112,30 +111,36 @@ jobs:
                     emptyDir: {}
           EOF
 
-      # 7) Runner가 소스를 Pod로 복사 → .ready 터치해서 빌드 시작
-      - name: Copy source into pod & release init
+      # 7) 소스 tar로 업로드(재시도) → .ready 터치해서 빌드 시작
+      - name: Upload source (tar+exec) & release init
         run: |
           set -e
+          # 파드가 생성될 때까지 대기
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && break
             sleep 2
           done
           echo "POD=$POD"
-          kubectl -n "$NAMESPACE" cp "$GITHUB_WORKSPACE/." "$POD":/workspace -c fetch-src
-          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'touch /workspace/.ready; ls -lah /workspace | head -n 50'
 
-      # 8) 스트리밍 로그 (best-effort: 실패 무시)
-      - name: Stream Kaniko logs (best-effort)
-        run: |
-          set +e
-          POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
-          # 스트리밍 에러가 나도 실패 처리하지 않도록 --ignore-errors + || true
-          kubectl -n "$NAMESPACE" logs -f "$POD" -c kaniko --ignore-errors=true 2>&1 | sed -u 's/^/[kaniko] /' &
-          sleep 5
-          exit 0
+          TAR="$RUNNER_TEMP/src.tgz"
+          tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
 
-      # 9) Kaniko 완료 대기 + 실패시 진단 로그
+          # 업로드 재시도 5회
+          ok=0
+          for i in {1..5}; do
+            if cat "$TAR" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc 'cat > /workspace/src.tgz'; then
+              ok=1; break
+            fi
+            echo "upload failed; retry $i/5"; sleep 3
+          done
+          [ "$ok" = "1" ]
+
+          # 압축 해제 + .ready 생성
+          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc \
+            'tar -xzf /workspace/src.tgz -C /workspace && rm /workspace/src.tgz && touch /workspace/.ready && ls -lah /workspace | head -n 50'
+
+      # 8) Kaniko 완료 대기 (실패 시 진단 로그 출력)
       - name: Wait for Kaniko build to finish (with diagnostics)
         run: |
           set -e
@@ -153,7 +158,7 @@ jobs:
             exit 1
           fi
 
-      # 10) 배포 적용 및 이미지 태그 갱신
+      # 9) 배포 적용 및 이미지 태그 갱신
       - name: Set image and rollout
         run: |
           set -e
