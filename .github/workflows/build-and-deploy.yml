@@ -112,8 +112,8 @@ jobs:
                     emptyDir: {}
           EOF
 
-      # 7) 소스 tar로 업로드(재시도) → .ready 터치해서 빌드 시작
-      - name: Upload source (tar+exec) & release init
+      # 7) 소스 조각 업로드(1MB chunk, 재시도) → 재조립 → .ready 터치
+      - name: Upload source in chunks & release init
         run: |
           set -e
           # 파드가 생성될 때까지 대기
@@ -124,22 +124,37 @@ jobs:
           done
           echo "POD=$POD"
 
+          # 원격 업로드 디렉터리 준비
+          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'rm -rf /workspace/upload && mkdir -p /workspace/upload'
+
+          # 소스 tar 생성 후 1MB 조각으로 분할
           TAR="$RUNNER_TEMP/src.tgz"
           tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
+          split -b 1m -d -a 4 "$TAR" "$RUNNER_TEMP/part."
 
-          # 업로드 재시도 5회
-          ok=0
-          for i in {1..5}; do
-            if cat "$TAR" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc 'cat > /workspace/src.tgz'; then
-              ok=1; break
-            fi
-            echo "upload failed; retry $i/5"; sleep 3
+          # 각 조각 업로드 (실패 시 재시도)
+          for f in $RUNNER_TEMP/part.*; do
+            bn=$(basename "$f")
+            ok=0
+            for i in {1..6}; do
+              if cat "$f" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc "cat > /workspace/upload/$bn"; then
+                ok=1; break
+              fi
+              echo "chunk $bn failed; retry $i/6"; sleep 2
+            done
+            [ "$ok" = "1" ] || (echo "giving up chunk $bn"; exit 1)
           done
-          [ "$ok" = "1" ]
 
-          # 압축 해제 + .ready 생성
-          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc \
-            'tar -xzf /workspace/src.tgz -C /workspace && rm /workspace/src.tgz && touch /workspace/.ready && ls -lah /workspace | head -n 50'
+          # 리모트에서 재조립 + 해제 + .ready 생성
+          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
+            set -e
+            cat /workspace/upload/part.* > /workspace/src.tgz
+            rm -rf /workspace/upload
+            tar -xzf /workspace/src.tgz -C /workspace
+            rm /workspace/src.tgz
+            touch /workspace/.ready
+            ls -lah /workspace | head -n 50
+          '
 
       # 8) Kaniko 완료 대기 (실패 시 진단 로그 출력)
       - name: Wait for Kaniko build to finish (with diagnostics)
