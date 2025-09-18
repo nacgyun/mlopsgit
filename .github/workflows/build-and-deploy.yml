@@ -59,13 +59,10 @@ jobs:
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (initContainer: git clone → /workspace)
+      # 6) Kaniko Job 실행 (init: 외부 네트워크 X → /workspace/.ready가 생길 때까지 대기)
       - name: Launch Kaniko Job
-        env:
-          REPO: ${{ github.repository }}   # owner/repo
-          REV:  ${{ github.sha }}          # commit sha
         run: |
-          cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
+          cat <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -77,28 +74,15 @@ jobs:
                 restartPolicy: Never
                 initContainers:
                   - name: fetch-src
-                    image: bitnami/git:2.45.2-debian-12-r0
-                    env:
-                      - name: REPO
-                        value: "${REPO}"
-                      - name: REV
-                        value: "${REV}"
-                      - name: GITHUB_TOKEN
-                        value: "${{ secrets.GITHUB_TOKEN }}"
-                    command: ["/bin/bash","-lc"]
+                    image: alpine:3.20
+                    command: ["/bin/sh","-lc"]
                     args:
                       - |
-                        set -euo pipefail
+                        set -e
                         mkdir -p /workspace
-                        echo ">> cloning https://github.com/${REPO}.git@${REV}"
-                        git config --global advice.detachedHead false
-                        git clone --no-tags --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" /workspace
-                        cd /workspace
-                        # 강제푸시 등으로 SHA가 브랜치에 없을 경우를 대비
-                        git fetch origin "${REV}" --depth 1 || true
-                        git checkout "${REV}" || true
-                        test -f /workspace/Dockerfile || { echo "Dockerfile not found at /workspace/Dockerfile"; exit 2; }
-                        ls -lah /workspace | head -n 50
+                        echo ">> waiting for /workspace/.ready ..."
+                        while [ ! -f /workspace/.ready ]; do sleep 1; done
+                        echo ">> ready, init exit"
                     volumeMounts:
                       - name: workspace
                         mountPath: /workspace
@@ -109,7 +93,7 @@ jobs:
                       - --context=/workspace
                       - --dockerfile=/workspace/Dockerfile
                       - --destination=${IMAGE}
-                      # 캐시 활성화 원하면 아래 2줄 주석 해제
+                      # 캐시 사용 원하면 아래 주석 해제
                       # - --cache=true
                       # - --cache-repo=${IMAGE_REPO}-cache
                     volumeMounts:
@@ -128,20 +112,52 @@ jobs:
                     emptyDir: {}
           EOF
 
-      # 7) Kaniko 완료 대기 + 로그 출력
-      - name: Wait for Kaniko build to finish
+      # 7) Runner가 소스를 Pod로 복사 → .ready 터치해서 빌드 시작
+      - name: Copy source into pod & release init
         run: |
           set -e
-          kubectl -n "$NAMESPACE" wait --for=condition=Complete job/kaniko-build --timeout=20m
-          POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
-          echo "== Kaniko Logs =="
-          kubectl -n "$NAMESPACE" logs "$POD"
+          # 파드가 생성될 때까지 대기
+          for i in {1..60}; do
+            POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            [ -n "$POD" ] && break
+            sleep 2
+          done
+          echo "POD=$POD"
+          # 워크스페이스 전체를 init 컨테이너에 복사
+          kubectl -n "$NAMESPACE" cp "$GITHUB_WORKSPACE/." "$POD":/workspace -c fetch-src
+          # .ready 파일 생성 → init 종료, kaniko 시작
+          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'touch /workspace/.ready; ls -lah /workspace | head -n 50'
 
-      # 8) 배포 적용 및 이미지 태그 갱신
+      # 8) (선택) 실시간 로그 스트리밍
+      - name: Stream Kaniko logs (live)
+        run: |
+          set -e
+          POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "$NAMESPACE" logs -f "$POD" -c kaniko & sleep 5 || true
+
+      # 9) Kaniko 완료 대기 + 실패시 진단 로그
+      - name: Wait for Kaniko build to finish (with diagnostics)
+        run: |
+          set -e
+          if ! kubectl -n "$NAMESPACE" wait --for=condition=Complete job/kaniko-build --timeout=20m; then
+            echo "== JOB FAILED: diagnostics =="
+            kubectl -n "$NAMESPACE" get job/kaniko-build -o wide || true
+            kubectl -n "$NAMESPACE" describe job/kaniko-build || true
+            kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o wide || true
+            POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
+            kubectl -n "$NAMESPACE" describe pod "$POD" || true
+            echo "== INIT(fetch-src) TAIL =="
+            kubectl -n "$NAMESPACE" logs "$POD" -c fetch-src --tail=200 || true
+            echo "== KANIKO TAIL =="
+            kubectl -n "$NAMESPACE" logs "$POD" -c kaniko --tail=200 || true
+            exit 1
+          fi
+
+      # 10) 배포 적용 및 이미지 태그 갱신
       - name: Set image and rollout
         run: |
           set -e
           kubectl -n "$NAMESPACE" apply -f k8s/deploy.yaml
           kubectl -n "$NAMESPACE" set image deploy/${APP_NAME} ${APP_NAME}=${IMAGE} --record
           kubectl -n "$NAMESPACE" rollout status deploy/${APP_NAME} --timeout=5m
-                 
+
