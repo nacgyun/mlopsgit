@@ -59,7 +59,7 @@ jobs:
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (initContainer: 소스 아카이브 다운로드 → /workspace 에 압축 해제)
+      # 6) Kaniko Job 실행 (initContainer: git clone → /workspace)
       - name: Launch Kaniko Job
         env:
           REPO: ${{ github.repository }}   # owner/repo
@@ -77,7 +77,7 @@ jobs:
                 restartPolicy: Never
                 initContainers:
                   - name: fetch-src
-                    image: alpine:3.20
+                    image: bitnami/git:2.45.2-debian-12-r0
                     env:
                       - name: REPO
                         value: "${REPO}"
@@ -85,18 +85,19 @@ jobs:
                         value: "${REV}"
                       - name: GITHUB_TOKEN
                         value: "${{ secrets.GITHUB_TOKEN }}"
-                    command: ["/bin/sh","-lc"]
+                    command: ["/bin/bash","-lc"]
                     args:
                       - |
-                        set -e
-                        apk add --no-cache curl tar
+                        set -euo pipefail
                         mkdir -p /workspace
-                        # GitHub API 아카이브 다운로드 (private repo 지원, 토큰 헤더)
-                        echo ">> downloading source archive ..."
-                        curl -Ls -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                          -o /tmp/src.tgz "https://api.github.com/repos/${REPO}/tarball/${REV}"
-                        echo ">> extracting ..."
-                        tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
+                        echo ">> cloning https://github.com/${REPO}.git@${REV}"
+                        git config --global advice.detachedHead false
+                        git clone --no-tags --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" /workspace
+                        cd /workspace
+                        # 강제푸시 등으로 SHA가 브랜치에 없을 경우를 대비
+                        git fetch origin "${REV}" --depth 1 || true
+                        git checkout "${REV}" || true
+                        test -f /workspace/Dockerfile || { echo "Dockerfile not found at /workspace/Dockerfile"; exit 2; }
                         ls -lah /workspace | head -n 50
                     volumeMounts:
                       - name: workspace
@@ -143,4 +144,4 @@ jobs:
           kubectl -n "$NAMESPACE" apply -f k8s/deploy.yaml
           kubectl -n "$NAMESPACE" set image deploy/${APP_NAME} ${APP_NAME}=${IMAGE} --record
           kubectl -n "$NAMESPACE" rollout status deploy/${APP_NAME} --timeout=5m
-
+                 
