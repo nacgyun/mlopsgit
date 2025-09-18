@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) kubectl 설치 (PATH 반영은 다음 스텝부터)
+      # 1) kubectl 설치 (PATH는 다음 스텝부터 반영)
       - name: Install kubectl (no-sudo)
         run: |
           set -e
@@ -56,12 +56,14 @@ jobs:
 
       # 5) 이전 Kaniko Job 정리
       - name: Cleanup previous Kaniko Job
-        run: kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
+        run: |
+          kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (envsubst 제거, 셸 확장 사용)
+      # 6) Kaniko Job 실행 (initContainer로 git clone → 로컬 컨텍스트 빌드)
       - name: Launch Kaniko Job
         env:
-          GIT_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git#${{ github.sha }}
+          REPO: ${{ github.repository }}   # owner/repo
+          REV:  ${{ github.sha }}          # commit sha
         run: |
           cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
           apiVersion: batch/v1
@@ -73,18 +75,39 @@ jobs:
             template:
               spec:
                 restartPolicy: Never
+                initContainers:
+                  - name: fetch-src
+                    image: alpine/git:2.45.2
+                    env:
+                      - name: GIT_URL
+                        value: "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${REPO}.git"
+                    command: ["/bin/sh","-lc"]
+                    args:
+                      - |
+                        set -e
+                        git config --global advice.detachedHead false
+                        git clone --no-tags --depth 1 "$GIT_URL" /workspace
+                        cd /workspace
+                        git fetch origin "${REV}" --depth=1 || true
+                        git checkout "${REV}" || true
+                    volumeMounts:
+                      - name: workspace
+                        mountPath: /workspace
                 containers:
                   - name: kaniko
                     image: gcr.io/kaniko-project/executor:latest
                     args:
-                      - --context=${GIT_URL}
-                      - --dockerfile=Dockerfile
+                      - --context=/workspace
+                      - --dockerfile=/workspace/Dockerfile
                       - --destination=${IMAGE}
+                      # 캐시 활성화 원하면 아래 2줄 주석 해제
                       # - --cache=true
                       # - --cache-repo=${IMAGE_REPO}-cache
                     volumeMounts:
                       - name: docker-config
                         mountPath: /kaniko/.docker/
+                      - name: workspace
+                        mountPath: /workspace
                 volumes:
                   - name: docker-config
                     secret:
@@ -92,6 +115,8 @@ jobs:
                       items:
                         - key: .dockerconfigjson
                           path: config.json
+                  - name: workspace
+                    emptyDir: {}
           EOF
 
       # 7) Kaniko 완료 대기 + 로그 출력
