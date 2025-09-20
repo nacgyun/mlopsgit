@@ -68,63 +68,37 @@ jobs:
             | kubectl -n "$NAMESPACE" apply -f -
 
       # 소스 압축 → 1MB 청크 업로드 → 리모트에서 재조립/해제 → .ready 터치
-      - name: Upload source in chunks & release init
+      - name: Upload source (streaming) & release init
         run: |
-          set -e
+          set -euo pipefail
 
           # 1) Job로부터 Pod 이름을 가져올 때까지 대기
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-            [ -n "$POD" ] && break
+            [ -n "${POD:-}" ] && break
             sleep 2
           done
           echo "POD=${POD:-<none>}"
           [ -n "${POD:-}" ] || { echo "Pod not found"; exit 1; }
 
-          # 2) init 컨테이너(fetch-src)가 '생성되어' '실행 중'일 때까지 대기
-          #    상태가 잡히기 전 exec 하면 'container not found'가 납니다.
+          # 2) init 컨테이너(fetch-src)가 실행 상태일 때까지 대기
           for i in {1..90}; do
             RUNNING=$(kubectl -n "$NAMESPACE" get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="fetch-src")].state.running.startedAt}' 2>/dev/null || true)
             [ -n "$RUNNING" ] && break
             sleep 2
           done
-          if [ -z "$RUNNING" ]; then
-            echo "fetch-src init container not running yet"
-            kubectl -n "$NAMESPACE" describe pod "$POD" || true
-            exit 1
-          fi
+          [ -n "$RUNNING" ] || { echo "fetch-src not running"; kubectl -n "$NAMESPACE" describe pod "$POD" || true; exit 1; }
 
-          # 3) 원격 업로드 디렉토리 준비
-          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'rm -rf /workspace/upload && mkdir -p /workspace/upload'
-
-          # 4) 소스 tar 생성 후 1MB 청크로 분할
-          TAR="$RUNNER_TEMP/src.tgz"
-          tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
-          split -b 1m -d -a 4 "$TAR" "$RUNNER_TEMP/part."
-
-          # 5) 청크 업로드(재시도 포함)
-          for f in $RUNNER_TEMP/part.*; do
-            bn=$(basename "$f")
-            ok=0
-            for i in {1..6}; do
-              if cat "$f" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc "cat > /workspace/upload/$bn"; then
-                ok=1; break
-              fi
-              echo "chunk $bn failed; retry $i/6"; sleep 2
-            done
-            [ "$ok" = "1" ] || (echo "giving up chunk $bn"; exit 1)
-          done
-
-          # 6) 리모트에서 재조립/해제 후 .ready 생성 → init 종료
-          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
-            set -e
-            cat /workspace/upload/part.* > /workspace/src.tgz
-            rm -rf /workspace/upload
-            tar -xzf /workspace/src.tgz -C /workspace
-            rm /workspace/src.tgz
-            touch /workspace/.ready
-            ls -lah /workspace | head -n 50
-          '
+          # 3) 스트리밍으로 바로 /workspace 에 압축 해제 (중간 파일 없음)
+          #    로컬에서 tar.gz 생성 -> exec 표준입력으로 전달 -> 원격에서 즉시 풀기
+          tar -C "$GITHUB_WORKSPACE" -czf - . \
+            | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc '
+                set -euo pipefail
+                rm -rf /workspace/*
+                tar -xzf - -C /workspace
+                ls -lah /workspace | head -n 50
+                touch /workspace/.ready
+              '
 
 
       # Kaniko 완료 대기 (실패 시 진단)
