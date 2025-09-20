@@ -27,7 +27,7 @@ spec:
           args:
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=${IMAGE}
+            - --destination=__IMAGE__
           volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker/

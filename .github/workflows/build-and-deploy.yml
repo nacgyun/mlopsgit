@@ -19,9 +19,11 @@ env:
 jobs:
   build-and-deploy:
     runs-on: self-hosted
+
     steps:
       - uses: actions/checkout@v4
 
+      # kubectl 설치
       - name: Install kubectl (no-sudo)
         run: |
           set -e
@@ -30,6 +32,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
+      # kubeconfig 주입 + 확인
       - name: Configure kube access & verify
         run: |
           set -e
@@ -38,10 +41,12 @@ jobs:
           kubectl version --client
           kubectl get ns || true
 
+      # 네임스페이스 보장
       - name: Ensure namespace exists
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
+      # GHCR 도커 시크릿 (kaniko가 /kaniko/.docker/config.json 사용)
       - name: Ensure GHCR docker secret
         run: |
           kubectl -n "$NAMESPACE" create secret docker-registry ghcr-creds \
@@ -51,18 +56,22 @@ jobs:
             --docker-email="ci@example.local" \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      # 직전 Kaniko Job 제거
       - name: Cleanup previous Kaniko Job
-        run: kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
-
-      # Kaniko Job 적용 (템플릿 파일에서 값 치환)
-      - name: Launch Kaniko Job
         run: |
-          IMAGE="${IMAGE}" envsubst < k8s/kaniko-job.yaml.tmpl | kubectl -n "$NAMESPACE" apply -f -
+          kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 소스 업로드 → init 해제(.ready 생성)
+      # Kaniko Job 적용 (템플릿 치환: __IMAGE__ -> $IMAGE)
+      - name: Apply Kaniko Job from template
+        run: |
+          sed "s|__IMAGE__|${IMAGE}|g" k8s/kaniko-job.yaml.tmpl \
+            | kubectl -n "$NAMESPACE" apply -f -
+
+      # 소스 압축 → 1MB 청크 업로드 → 리모트에서 재조립/해제 → .ready 터치
       - name: Upload source in chunks & release init
         run: |
           set -e
+          # 파드가 생성될 때까지 대기
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && break
@@ -70,21 +79,28 @@ jobs:
           done
           echo "POD=$POD"
 
+          # 원격 업로드 디렉터리 준비
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'rm -rf /workspace/upload && mkdir -p /workspace/upload'
 
+          # 소스 tar 생성 후 1MB로 분할
           TAR="$RUNNER_TEMP/src.tgz"
           tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
           split -b 1m -d -a 4 "$TAR" "$RUNNER_TEMP/part."
 
+          # 각 청크 업로드(재시도)
           for f in $RUNNER_TEMP/part.*; do
-            bn=$(basename "$f"); ok=0
+            bn=$(basename "$f")
+            ok=0
             for i in {1..6}; do
-              if cat "$f" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc "cat > /workspace/upload/$bn"; then ok=1; break; fi
+              if cat "$f" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc "cat > /workspace/upload/$bn"; then
+                ok=1; break
+              fi
               echo "chunk $bn failed; retry $i/6"; sleep 2
             done
             [ "$ok" = "1" ] || (echo "giving up chunk $bn"; exit 1)
           done
 
+          # 리모트에서 재조립/해제 후, init 종료 신호 파일 생성
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
             set -e
             cat /workspace/upload/part.* > /workspace/src.tgz
@@ -95,6 +111,7 @@ jobs:
             ls -lah /workspace | head -n 50
           '
 
+      # Kaniko 완료 대기 (실패 시 진단)
       - name: Wait for Kaniko build to finish (with diagnostics)
         run: |
           set -e
@@ -105,21 +122,27 @@ jobs:
             kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o wide || true
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
             kubectl -n "$NAMESPACE" describe pod "$POD" || true
-            echo "== INIT(fetch-src) tail =="; kubectl -n "$NAMESPACE" logs "$POD" -c fetch-src --tail=200 || true
-            echo "== KANIKO tail ==";      kubectl -n "$NAMESPACE" logs "$POD" -c kaniko --tail=200 || true
+            echo "== INIT(fetch-src) tail =="
+            kubectl -n "$NAMESPACE" logs "$POD" -c fetch-src --tail=200 || true
+            echo "== KANIKO tail =="
+            kubectl -n "$NAMESPACE" logs "$POD" -c kaniko --tail=200 || true
             exit 1
           fi
 
-      # (옵션) 학습 잡 실행 — MLflow 기록
-      - name: Run training Job (MLflow)
+      # 학습 Job 적용 (템플릿 치환: __IMAGE__ -> $IMAGE)
+      - name: Apply training Job (MLflow) from template
         run: |
-          IMAGE="${IMAGE}" envsubst < k8s/iris-train.yaml.tmpl | kubectl -n "$NAMESPACE" apply -f -
+          kubectl -n "$NAMESPACE" delete job iris-train --ignore-not-found
+          sed "s|__IMAGE__|${IMAGE}|g" k8s/iris-train.yaml.tmpl \
+            | kubectl -n "$NAMESPACE" apply -f -
 
+      # (옵션) 학습 로그 tail — 실패해도 워크플로 계속
       - name: Tail training logs (best-effort)
         continue-on-error: true
-        run: kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
+        run: |
+          kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
 
-      # 앱 배포
+      # 배포 적용 + 이미지 태그 갱신
       - name: Set image and rollout
         run: |
           set -e
