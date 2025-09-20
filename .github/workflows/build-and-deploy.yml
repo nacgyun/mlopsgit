@@ -19,7 +19,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: self-hosted
-
     steps:
       - uses: actions/checkout@v4
 
@@ -53,67 +52,17 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Cleanup previous Kaniko Job
-        run: |
-          kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
+        run: kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
+      # Kaniko Job 적용 (템플릿 파일에서 값 치환)
       - name: Launch Kaniko Job
         run: |
-          set -e
-          # 1) 본문을 임시 파일에 저장(들여쓰기 그대로)
-          cat > /tmp/kaniko.job.src <<'K8S'
-                    apiVersion: batch/v1
-                    kind: Job
-                    metadata:
-                      name: kaniko-build
-                    spec:
-                      backoffLimit: 0
-                      template:
-                        spec:
-                          restartPolicy: Never
-                          initContainers:
-                            - name: fetch-src
-                              image: alpine:3.20
-                              command: ["/bin/sh","-lc"]
-                              args:
-                                - |
-                                  set -e
-                                  mkdir -p /workspace
-                                  echo "waiting for /workspace/.ready ..."
-                                  while [ ! -f /workspace/.ready ]; do sleep 1; done
-                                  echo "ready"
-                              volumeMounts:
-                                - name: workspace
-                                  mountPath: /workspace
-                          containers:
-                            - name: kaniko
-                              image: gcr.io/kaniko-project/executor:latest
-                              args:
-                                - --context=/workspace
-                                - --dockerfile=/workspace/Dockerfile
-                                - --destination=${IMAGE}
-                              volumeMounts:
-                                - name: docker-config
-                                  mountPath: /kaniko/.docker/
-                                - name: workspace
-                                  mountPath: /workspace
-                          volumes:
-                            - name: docker-config
-                              secret:
-                                secretName: ghcr-creds
-                                items:
-                                  - key: .dockerconfigjson
-                                    path: config.json
-                            - name: workspace
-                              emptyDir: {}
-K8S
-          # 2) 앞 10칸 공백 제거 후 적용
-          sed -e 's/^ \{10\}//' /tmp/kaniko.job.src > /tmp/kaniko.job.yaml
-          kubectl -n "$NAMESPACE" apply -f /tmp/kaniko.job.yaml
+          IMAGE="${IMAGE}" envsubst < k8s/kaniko-job.yaml.tmpl | kubectl -n "$NAMESPACE" apply -f -
 
+      # 소스 업로드 → init 해제(.ready 생성)
       - name: Upload source in chunks & release init
         run: |
           set -e
-          # 파드가 생성될 때까지 대기
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && break
@@ -121,28 +70,21 @@ K8S
           done
           echo "POD=$POD"
 
-          # 원격 업로드 디렉터리 준비
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'rm -rf /workspace/upload && mkdir -p /workspace/upload'
 
-          # 소스 tar 생성 후 1MB 조각으로 분할
           TAR="$RUNNER_TEMP/src.tgz"
           tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
           split -b 1m -d -a 4 "$TAR" "$RUNNER_TEMP/part."
 
-          # 각 조각 업로드 (실패 시 재시도)
           for f in $RUNNER_TEMP/part.*; do
-            bn=$(basename "$f")
-            ok=0
+            bn=$(basename "$f"); ok=0
             for i in {1..6}; do
-              if cat "$f" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc "cat > /workspace/upload/$bn"; then
-                ok=1; break
-              fi
+              if cat "$f" | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc "cat > /workspace/upload/$bn"; then ok=1; break; fi
               echo "chunk $bn failed; retry $i/6"; sleep 2
             done
             [ "$ok" = "1" ] || (echo "giving up chunk $bn"; exit 1)
           done
 
-          # 리모트에서 재조립 + 해제 + .ready 생성
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
             set -e
             cat /workspace/upload/part.* > /workspace/src.tgz
@@ -163,62 +105,21 @@ K8S
             kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o wide || true
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
             kubectl -n "$NAMESPACE" describe pod "$POD" || true
-            echo "== INIT(fetch-src) tail =="
-            kubectl -n "$NAMESPACE" logs "$POD" -c fetch-src --tail=200 || true
-            echo "== KANIKO tail =="
-            kubectl -n "$NAMESPACE" logs "$POD" -c kaniko --tail=200 || true
+            echo "== INIT(fetch-src) tail =="; kubectl -n "$NAMESPACE" logs "$POD" -c fetch-src --tail=200 || true
+            echo "== KANIKO tail ==";      kubectl -n "$NAMESPACE" logs "$POD" -c kaniko --tail=200 || true
             exit 1
           fi
 
+      # (옵션) 학습 잡 실행 — MLflow 기록
       - name: Run training Job (MLflow)
         run: |
-          set -e
-          # 임시 파일에 저장 후 들여쓰기 제거
-          cat > /tmp/iris-train.src <<'K8S'
-                    apiVersion: batch/v1
-                    kind: Job
-                    metadata:
-                      name: iris-train
-                      labels: { app: iris-train }
-                    spec:
-                      ttlSecondsAfterFinished: 600
-                      backoffLimit: 0
-                      template:
-                        spec:
-                          restartPolicy: Never
-                          # GHCR가 private이면 pull 자격 필요
-                          imagePullSecrets:
-                            - name: ghcr-creds
-                          containers:
-                            - name: train
-                              image: ${IMAGE}
-                              imagePullPolicy: IfNotPresent
-                              env:
-                                # MLflow 서버로 기록
-                                - name: MLFLOW_TRACKING_URI
-                                  value: http://mlflow.mlops.svc.cluster.local:5000
-                                - name: MLFLOW_EXPERIMENT_NAME
-                                  value: iris-rf
-                                # (선택) 아티팩트를 MinIO(S3)에 저장
-                                - name: MLFLOW_S3_ENDPOINT_URL
-                                  value: http://minio.mlops.svc.cluster.local:9000
-                                - name: AWS_ACCESS_KEY_ID
-                                  valueFrom: { secretKeyRef: { name: minio-creds, key: accessKey } }
-                                - name: AWS_SECRET_ACCESS_KEY
-                                  valueFrom: { secretKeyRef: { name: minio-creds, key: secretKey } }
-                              resources:
-                                requests: { cpu: "500m", memory: "1Gi" }
-                                limits:   { cpu: "2",    memory: "4Gi" }
-K8S
-          sed -e 's/^ \{10\}//' /tmp/iris-train.src > /tmp/iris-train.yaml
-          kubectl -n "$NAMESPACE" delete job iris-train --ignore-not-found
-          kubectl -n "$NAMESPACE" apply -f /tmp/iris-train.yaml
+          IMAGE="${IMAGE}" envsubst < k8s/iris-train.yaml.tmpl | kubectl -n "$NAMESPACE" apply -f -
 
       - name: Tail training logs (best-effort)
         continue-on-error: true
-        run: |
-          kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
+        run: kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
 
+      # 앱 배포
       - name: Set image and rollout
         run: |
           set -e

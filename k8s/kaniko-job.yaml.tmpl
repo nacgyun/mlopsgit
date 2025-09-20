@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kaniko-build
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: fetch-src
+          image: alpine:3.20
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -e
+              mkdir -p /workspace
+              echo "waiting for /workspace/.ready ..."
+              while [ ! -f /workspace/.ready ]; do sleep 1; done
+              echo "ready"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - --context=/workspace
+            - --dockerfile=/workspace/Dockerfile
+            - --destination=${IMAGE}
+          volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker/
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: docker-config
+          secret:
+            secretName: ghcr-creds
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        - name: workspace
+          emptyDir: {}
+
