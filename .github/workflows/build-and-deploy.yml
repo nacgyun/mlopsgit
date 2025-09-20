@@ -1,4 +1,5 @@
 name: build-and-deploy
+
 on:
   push:
     branches: ["master"]
@@ -11,9 +12,9 @@ permissions:
 env:
   NAMESPACE: mlops
   APP_NAME: myapp
-  IMAGE_REPO: ghcr.io/${{ github.repository }}
-  IMAGE_TAG: ${{ github.sha }}
-  IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+  IMAGE_REPO: "ghcr.io/${{ github.repository }}"
+  IMAGE_TAG: "${{ github.sha }}"
+  IMAGE: "ghcr.io/${{ github.repository }}:${{ github.sha }}"
 
 jobs:
   build-and-deploy:
@@ -21,7 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) kubectl 설치 (PATH는 다음 스텝부터 반영)
       - name: Install kubectl (no-sudo)
         run: |
           set -e
@@ -30,7 +30,6 @@ jobs:
           chmod +x "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
-      # 2) kubeconfig 주입 + 기본 확인
       - name: Configure kube access & verify
         run: |
           set -e
@@ -39,12 +38,10 @@ jobs:
           kubectl version --client
           kubectl get ns || true
 
-      # 3) 네임스페이스 없으면 생성
       - name: Ensure namespace exists
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      # 4) GHCR 푸시용 도커 시크릿 (Kaniko가 /kaniko/.docker/config.json 사용)
       - name: Ensure GHCR docker secret
         run: |
           kubectl -n "$NAMESPACE" create secret docker-registry ghcr-creds \
@@ -54,15 +51,13 @@ jobs:
             --docker-email="ci@example.local" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # 5) 이전 Kaniko Job 정리
       - name: Cleanup previous Kaniko Job
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # 6) Kaniko Job 실행 (외부 egress 없어도 동작: runner가 소스 넣을 때까지 대기)
       - name: Launch Kaniko Job
         run: |
-          cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
+          cat <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -80,9 +75,9 @@ jobs:
                       - |
                         set -e
                         mkdir -p /workspace
-                        echo ">> waiting for /workspace/.ready ..."
+                        echo "waiting for /workspace/.ready ..."
                         while [ ! -f /workspace/.ready ]; do sleep 1; done
-                        echo ">> ready, init exit"
+                        echo "ready"
                     volumeMounts:
                       - name: workspace
                         mountPath: /workspace
@@ -93,9 +88,6 @@ jobs:
                       - --context=/workspace
                       - --dockerfile=/workspace/Dockerfile
                       - --destination=${IMAGE}
-                      # 캐시 원하면 아래 주석 해제
-                      # - --cache=true
-                      # - --cache-repo=${IMAGE_REPO}-cache
                     volumeMounts:
                       - name: docker-config
                         mountPath: /kaniko/.docker/
@@ -110,13 +102,12 @@ jobs:
                           path: config.json
                   - name: workspace
                     emptyDir: {}
-          EOF
+EOF
 
-      # 7) 소스 조각 업로드(1MB chunk, 재시도) → 재조립 → .ready 터치
       - name: Upload source in chunks & release init
         run: |
           set -e
-          # 파드가 생성될 때까지 대기
+          # wait for pod
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && break
@@ -124,15 +115,15 @@ jobs:
           done
           echo "POD=$POD"
 
-          # 원격 업로드 디렉터리 준비
+          # prepare upload dir
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'rm -rf /workspace/upload && mkdir -p /workspace/upload'
 
-          # 소스 tar 생성 후 1MB 조각으로 분할
+          # tar and split
           TAR="$RUNNER_TEMP/src.tgz"
           tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
           split -b 1m -d -a 4 "$TAR" "$RUNNER_TEMP/part."
 
-          # 각 조각 업로드 (실패 시 재시도)
+          # upload chunks
           for f in $RUNNER_TEMP/part.*; do
             bn=$(basename "$f")
             ok=0
@@ -145,7 +136,7 @@ jobs:
             [ "$ok" = "1" ] || (echo "giving up chunk $bn"; exit 1)
           done
 
-          # 리모트에서 재조립 + 해제 + .ready 생성
+          # reassemble and extract, then release
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
             set -e
             cat /workspace/upload/part.* > /workspace/src.tgz
@@ -156,7 +147,6 @@ jobs:
             ls -lah /workspace | head -n 50
           '
 
-      # 8) Kaniko 완료 대기 (실패 시 진단 로그 출력)
       - name: Wait for Kaniko build to finish (with diagnostics)
         run: |
           set -e
@@ -167,14 +157,13 @@ jobs:
             kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o wide || true
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}')
             kubectl -n "$NAMESPACE" describe pod "$POD" || true
-            echo "== INIT(fetch-src) TAIL =="
+            echo "== INIT(fetch-src) tail =="
             kubectl -n "$NAMESPACE" logs "$POD" -c fetch-src --tail=200 || true
-            echo "== KANIKO TAIL =="
+            echo "== KANIKO tail =="
             kubectl -n "$NAMESPACE" logs "$POD" -c kaniko --tail=200 || true
             exit 1
           fi
 
-            # 8.5) (선택) 학습 Job 실행 - MLflow에 기록 남김
       - name: Run training Job (MLflow)
         run: |
           cat <<'EOF' > /tmp/iris-train.yaml
@@ -189,7 +178,6 @@ jobs:
             template:
               spec:
                 restartPolicy: Never
-                # GHCR가 private이면 pull 자격 필요 (이미 위에서 ghcr-creds 생성)
                 imagePullSecrets:
                   - name: ghcr-creds
                 containers:
@@ -197,12 +185,10 @@ jobs:
                     image: ${IMAGE}
                     imagePullPolicy: IfNotPresent
                     env:
-                      # ✅ MLflow 서버 주소/실험 이름
                       - name: MLFLOW_TRACKING_URI
                         value: http://mlflow.mlops.svc.cluster.local:5000
                       - name: MLFLOW_EXPERIMENT_NAME
                         value: iris-rf
-                      # ������ (선택) 아티팩트를 MinIO(S3)에 저장하려면 서버/클라 모두 동일 설정
                       - name: MLFLOW_S3_ENDPOINT_URL
                         value: http://minio.mlops.svc.cluster.local:9000
                       - name: AWS_ACCESS_KEY_ID
@@ -213,19 +199,14 @@ jobs:
                       requests: { cpu: "500m", memory: "1Gi" }
                       limits:   { cpu: "2",    memory: "4Gi" }
           EOF
-
-          # 실행
           kubectl -n "$NAMESPACE" delete job iris-train --ignore-not-found
           kubectl -n "$NAMESPACE" apply -f /tmp/iris-train.yaml
 
-      # 8.6) (옵션) 학습 로그 따라붙기 — 실패해도 워크플로는 계속
       - name: Tail training logs (best-effort)
         continue-on-error: true
         run: |
           kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
 
-
-      # 9) 배포 적용 및 이미지 태그 갱신
       - name: Set image and rollout
         run: |
           set -e
