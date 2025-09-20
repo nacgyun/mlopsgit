@@ -174,6 +174,57 @@ jobs:
             exit 1
           fi
 
+            # 8.5) (선택) 학습 Job 실행 - MLflow에 기록 남김
+      - name: Run training Job (MLflow)
+        run: |
+          cat <<'EOF' > /tmp/iris-train.yaml
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: iris-train
+            labels: { app: iris-train }
+          spec:
+            ttlSecondsAfterFinished: 600
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                # GHCR가 private이면 pull 자격 필요 (이미 위에서 ghcr-creds 생성)
+                imagePullSecrets:
+                  - name: ghcr-creds
+                containers:
+                  - name: train
+                    image: ${IMAGE}
+                    imagePullPolicy: IfNotPresent
+                    env:
+                      # ✅ MLflow 서버 주소/실험 이름
+                      - name: MLFLOW_TRACKING_URI
+                        value: http://mlflow.mlops.svc.cluster.local:5000
+                      - name: MLFLOW_EXPERIMENT_NAME
+                        value: iris-rf
+                      # ������ (선택) 아티팩트를 MinIO(S3)에 저장하려면 서버/클라 모두 동일 설정
+                      - name: MLFLOW_S3_ENDPOINT_URL
+                        value: http://minio.mlops.svc.cluster.local:9000
+                      - name: AWS_ACCESS_KEY_ID
+                        valueFrom: { secretKeyRef: { name: minio-creds, key: accessKey } }
+                      - name: AWS_SECRET_ACCESS_KEY
+                        valueFrom: { secretKeyRef: { name: minio-creds, key: secretKey } }
+                    resources:
+                      requests: { cpu: "500m", memory: "1Gi" }
+                      limits:   { cpu: "2",    memory: "4Gi" }
+          EOF
+
+          # 실행
+          kubectl -n "$NAMESPACE" delete job iris-train --ignore-not-found
+          kubectl -n "$NAMESPACE" apply -f /tmp/iris-train.yaml
+
+      # 8.6) (옵션) 학습 로그 따라붙기 — 실패해도 워크플로는 계속
+      - name: Tail training logs (best-effort)
+        continue-on-error: true
+        run: |
+          kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
+
+
       # 9) 배포 적용 및 이미지 태그 갱신
       - name: Set image and rollout
         run: |
