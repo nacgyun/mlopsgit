@@ -9,7 +9,6 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      # GHCR가 private이면 pull 자격 필요
       imagePullSecrets:
         - name: ghcr-creds
       containers:
@@ -17,12 +16,10 @@ spec:
           image: __IMAGE__
           imagePullPolicy: IfNotPresent
           env:
-            # ✅ MLflow 서버 연결
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow.mlops.svc.cluster.local:5000
             - name: MLFLOW_EXPERIMENT_NAME
               value: iris-rf
-            # ������ (선택) 아티팩트를 MinIO(S3)에 저장
             - name: MLFLOW_S3_ENDPOINT_URL
               value: http://minio.mlops.svc.cluster.local:9000
             - name: AWS_ACCESS_KEY_ID
