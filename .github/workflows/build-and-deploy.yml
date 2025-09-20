@@ -61,7 +61,7 @@ jobs:
           sed "s|__IMAGE__|${IMAGE}|g" k8s/kaniko-job.yaml.tmpl \
             | kubectl -n "$NAMESPACE" apply -f -
 
-      # ✅ 스트리밍 업로드 + pipefail/타임아웃/준비확인 적용
+      # ✅ 스트리밍 업로드 + pipefail/타임아웃/준비확인 (내부 heredoc 제거)
       - name: Upload source (streaming) & release init
         run: |
           set -euo pipefail
@@ -103,14 +103,14 @@ jobs:
               if [ -n "$DF" ]; then
                 cp "$DF" /workspace/Dockerfile
               else
-                cat >/workspace/Dockerfile << "DF"
-FROM python:3.11-slim
-WORKDIR /app
-COPY ml/ /app/
-RUN if [ -f /app/requirements.txt ]; then pip install --no-cache-dir -r /app/requirements.txt; fi
-ENV MLFLOW_EXPERIMENT_NAME=iris-rf
-CMD ["python","-u","/app/train.py"]
-DF
+                printf "%s\n" \
+                  "FROM python:3.11-slim" \
+                  "WORKDIR /app" \
+                  "COPY ml/ /app/" \
+                  "RUN if [ -f /app/requirements.txt ]; then pip install --no-cache-dir -r /app/requirements.txt; fi" \
+                  "ENV MLFLOW_EXPERIMENT_NAME=iris-rf" \
+                  "CMD [\"python\",\"-u\",\"/app/train.py\"]" \
+                  > /workspace/Dockerfile
               fi
             fi
             ls -lah /workspace | head -n 50
