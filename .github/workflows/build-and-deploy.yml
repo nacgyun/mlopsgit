@@ -1,113 +1,56 @@
-name: build-and-deploy
-
-on:
-  push:
-    branches: ["master"]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
-
-env:
-  NAMESPACE: mlops
-  APP_NAME: myapp
-  IMAGE_REPO: "ghcr.io/${{ github.repository }}"
-  IMAGE_TAG: "${{ github.sha }}"
-  IMAGE: "ghcr.io/${{ github.repository }}:${{ github.sha }}"
-
-jobs:
-  build-and-deploy:
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install kubectl (no-sudo)
-        run: |
-          set -e
-          ver=$(curl -Ls https://dl.k8s.io/release/stable.txt)
-          curl -Ls -o "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl"
-          chmod +x "$RUNNER_TEMP/kubectl"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-
-      - name: Configure kube access & verify
-        run: |
-          set -e
-          echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
-          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
-          kubectl version --client
-          kubectl get ns || true
-
-      - name: Ensure namespace exists
-        run: |
-          kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
-
-      - name: Ensure GHCR docker secret
-        run: |
-          kubectl -n "$NAMESPACE" create secret docker-registry ghcr-creds \
-            --docker-server=ghcr.io \
-            --docker-username="${{ github.actor }}" \
-            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
-            --docker-email="ci@example.local" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Cleanup previous Kaniko Job
-        run: |
-          kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
-
       - name: Launch Kaniko Job
         run: |
-          cat <<'EOF' | kubectl -n "$NAMESPACE" apply -f -
-          apiVersion: batch/v1
-          kind: Job
-          metadata:
-            name: kaniko-build
-          spec:
-            backoffLimit: 0
-            template:
-              spec:
-                restartPolicy: Never
-                initContainers:
-                  - name: fetch-src
-                    image: alpine:3.20
-                    command: ["/bin/sh","-lc"]
-                    args:
-                      - |
-                        set -e
-                        mkdir -p /workspace
-                        echo "waiting for /workspace/.ready ..."
-                        while [ ! -f /workspace/.ready ]; do sleep 1; done
-                        echo "ready"
-                    volumeMounts:
-                      - name: workspace
-                        mountPath: /workspace
-                containers:
-                  - name: kaniko
-                    image: gcr.io/kaniko-project/executor:latest
-                    args:
-                      - --context=/workspace
-                      - --dockerfile=/workspace/Dockerfile
-                      - --destination=${IMAGE}
-                    volumeMounts:
-                      - name: docker-config
-                        mountPath: /kaniko/.docker/
-                      - name: workspace
-                        mountPath: /workspace
-                volumes:
-                  - name: docker-config
-                    secret:
-                      secretName: ghcr-creds
-                      items:
-                        - key: .dockerconfigjson
-                          path: config.json
-                  - name: workspace
-                    emptyDir: {}
-EOF
+          # NOTE: strip the first 10 leading spaces from the heredoc body
+          sed -e 's/^ \{10\}//' <<'K8S' | kubectl -n "$NAMESPACE" apply -f -
+                    apiVersion: batch/v1
+                    kind: Job
+                    metadata:
+                      name: kaniko-build
+                    spec:
+                      backoffLimit: 0
+                      template:
+                        spec:
+                          restartPolicy: Never
+                          initContainers:
+                            - name: fetch-src
+                              image: alpine:3.20
+                              command: ["/bin/sh","-lc"]
+                              args:
+                                - |
+                                  set -e
+                                  mkdir -p /workspace
+                                  echo "waiting for /workspace/.ready ..."
+                                  while [ ! -f /workspace/.ready ]; do sleep 1; done
+                                  echo "ready"
+                              volumeMounts:
+                                - name: workspace
+                                  mountPath: /workspace
+                          containers:
+                            - name: kaniko
+                              image: gcr.io/kaniko-project/executor:latest
+                              args:
+                                - --context=/workspace
+                                - --dockerfile=/workspace/Dockerfile
+                                - --destination=${IMAGE}
+                              volumeMounts:
+                                - name: docker-config
+                                  mountPath: /kaniko/.docker/
+                                - name: workspace
+                                  mountPath: /workspace
+                          volumes:
+                            - name: docker-config
+                              secret:
+                                secretName: ghcr-creds
+                                items:
+                                  - key: .dockerconfigjson
+                                    path: config.json
+                            - name: workspace
+                              emptyDir: {}
+K8S
 
       - name: Upload source in chunks & release init
         run: |
           set -e
-          # wait for pod
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "$POD" ] && break
@@ -115,15 +58,12 @@ EOF
           done
           echo "POD=$POD"
 
-          # prepare upload dir
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'rm -rf /workspace/upload && mkdir -p /workspace/upload'
 
-          # tar and split
           TAR="$RUNNER_TEMP/src.tgz"
           tar -C "$GITHUB_WORKSPACE" -czf "$TAR" .
           split -b 1m -d -a 4 "$TAR" "$RUNNER_TEMP/part."
 
-          # upload chunks
           for f in $RUNNER_TEMP/part.*; do
             bn=$(basename "$f")
             ok=0
@@ -136,7 +76,6 @@ EOF
             [ "$ok" = "1" ] || (echo "giving up chunk $bn"; exit 1)
           done
 
-          # reassemble and extract, then release
           kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
             set -e
             cat /workspace/upload/part.* > /workspace/src.tgz
@@ -166,51 +105,40 @@ EOF
 
       - name: Run training Job (MLflow)
         run: |
-          cat <<'EOF' > /tmp/iris-train.yaml
-          apiVersion: batch/v1
-          kind: Job
-          metadata:
-            name: iris-train
-            labels: { app: iris-train }
-          spec:
-            ttlSecondsAfterFinished: 600
-            backoffLimit: 0
-            template:
-              spec:
-                restartPolicy: Never
-                imagePullSecrets:
-                  - name: ghcr-creds
-                containers:
-                  - name: train
-                    image: ${IMAGE}
-                    imagePullPolicy: IfNotPresent
-                    env:
-                      - name: MLFLOW_TRACKING_URI
-                        value: http://mlflow.mlops.svc.cluster.local:5000
-                      - name: MLFLOW_EXPERIMENT_NAME
-                        value: iris-rf
-                      - name: MLFLOW_S3_ENDPOINT_URL
-                        value: http://minio.mlops.svc.cluster.local:9000
-                      - name: AWS_ACCESS_KEY_ID
-                        valueFrom: { secretKeyRef: { name: minio-creds, key: accessKey } }
-                      - name: AWS_SECRET_ACCESS_KEY
-                        valueFrom: { secretKeyRef: { name: minio-creds, key: secretKey } }
-                    resources:
-                      requests: { cpu: "500m", memory: "1Gi" }
-                      limits:   { cpu: "2",    memory: "4Gi" }
-          EOF
+          # same trick here to avoid heredoc indent issues
+          sed -e 's/^ \{10\}//' <<'K8S' > /tmp/iris-train.yaml
+                    apiVersion: batch/v1
+                    kind: Job
+                    metadata:
+                      name: iris-train
+                      labels: { app: iris-train }
+                    spec:
+                      ttlSecondsAfterFinished: 600
+                      backoffLimit: 0
+                      template:
+                        spec:
+                          restartPolicy: Never
+                          imagePullSecrets:
+                            - name: ghcr-creds
+                          containers:
+                            - name: train
+                              image: ${IMAGE}
+                              imagePullPolicy: IfNotPresent
+                              env:
+                                - name: MLFLOW_TRACKING_URI
+                                  value: http://mlflow.mlops.svc.cluster.local:5000
+                                - name: MLFLOW_EXPERIMENT_NAME
+                                  value: iris-rf
+                                - name: MLFLOW_S3_ENDPOINT_URL
+                                  value: http://minio.mlops.svc.cluster.local:9000
+                                - name: AWS_ACCESS_KEY_ID
+                                  valueFrom: { secretKeyRef: { name: minio-creds, key: accessKey } }
+                                - name: AWS_SECRET_ACCESS_KEY
+                                  valueFrom: { secretKeyRef: { name: minio-creds, key: secretKey } }
+                              resources:
+                                requests: { cpu: "500m", memory: "1Gi" }
+                                limits:   { cpu: "2",    memory: "4Gi" }
+K8S
           kubectl -n "$NAMESPACE" delete job iris-train --ignore-not-found
           kubectl -n "$NAMESPACE" apply -f /tmp/iris-train.yaml
-
-      - name: Tail training logs (best-effort)
-        continue-on-error: true
-        run: |
-          kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
-
-      - name: Set image and rollout
-        run: |
-          set -e
-          kubectl -n "$NAMESPACE" apply -f k8s/deploy.yaml
-          kubectl -n "$NAMESPACE" set image deploy/${APP_NAME} ${APP_NAME}=${IMAGE} --record
-          kubectl -n "$NAMESPACE" rollout status deploy/${APP_NAME} --timeout=5m
 
