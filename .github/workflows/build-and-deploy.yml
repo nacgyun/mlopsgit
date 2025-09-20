@@ -23,7 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # kubectl 설치
       - name: Install kubectl (no-sudo)
         run: |
           set -e
@@ -32,7 +31,6 @@ jobs:
           chmod +x "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
-      # kubeconfig 주입 + 확인
       - name: Configure kube access & verify
         run: |
           set -e
@@ -41,12 +39,10 @@ jobs:
           kubectl version --client
           kubectl get ns || true
 
-      # 네임스페이스 보장
       - name: Ensure namespace exists
         run: |
           kubectl get ns "$NAMESPACE" || kubectl create ns "$NAMESPACE"
 
-      # GHCR 도커 시크릿 (kaniko가 /kaniko/.docker/config.json 사용)
       - name: Ensure GHCR docker secret
         run: |
           kubectl -n "$NAMESPACE" create secret docker-registry ghcr-creds \
@@ -56,52 +52,71 @@ jobs:
             --docker-email="ci@example.local" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # 직전 Kaniko Job 제거
       - name: Cleanup previous Kaniko Job
         run: |
           kubectl -n "$NAMESPACE" delete job kaniko-build --ignore-not-found=true
 
-      # Kaniko Job 적용 (템플릿 치환: __IMAGE__ -> $IMAGE)
-      - name: Apply Kaniko Job from template
+      - name: Launch Kaniko Job
         run: |
           sed "s|__IMAGE__|${IMAGE}|g" k8s/kaniko-job.yaml.tmpl \
             | kubectl -n "$NAMESPACE" apply -f -
 
-      # 소스 압축 → 1MB 청크 업로드 → 리모트에서 재조립/해제 → .ready 터치
+      # ✅ 스트리밍 업로드 + pipefail/타임아웃/준비확인 적용
       - name: Upload source (streaming) & release init
         run: |
           set -euo pipefail
 
-          # 1) Job로부터 Pod 이름을 가져올 때까지 대기
+          echo "== wait for kaniko pod =="
           for i in {1..60}; do
             POD=$(kubectl -n "$NAMESPACE" get pods -l job-name=kaniko-build -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             [ -n "${POD:-}" ] && break
             sleep 2
           done
           echo "POD=${POD:-<none>}"
-          [ -n "${POD:-}" ] || { echo "Pod not found"; exit 1; }
+          [ -n "${POD:-}" ]
 
-          # 2) init 컨테이너(fetch-src)가 실행 상태일 때까지 대기
+          echo "== wait until init container(fetch-src) is Running =="
           for i in {1..90}; do
-            RUNNING=$(kubectl -n "$NAMESPACE" get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="fetch-src")].state.running.startedAt}' 2>/dev/null || true)
-            [ -n "$RUNNING" ] && break
+            ICS=$(kubectl -n "$NAMESPACE" get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="fetch-src")].state.running}')
+            [ -n "${ICS:-}" ] && break
+            PHASE=$(kubectl -n "$NAMESPACE" get pod "$POD" -o jsonpath='{.status.phase}')
+            if [ "$PHASE" = "Failed" ]; then
+              kubectl -n "$NAMESPACE" describe pod "$POD" || true
+              exit 1
+            fi
             sleep 2
           done
-          [ -n "$RUNNING" ] || { echo "fetch-src not running"; kubectl -n "$NAMESPACE" describe pod "$POD" || true; exit 1; }
+          echo "init container is running"
 
-          # 3) 스트리밍으로 바로 /workspace 에 압축 해제 (중간 파일 없음)
-          #    로컬에서 tar.gz 생성 -> exec 표준입력으로 전달 -> 원격에서 즉시 풀기
+          echo "== sanity check =="
+          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc 'echo OK && uname -a'
+
+          echo "== upload & extract =="
           tar -C "$GITHUB_WORKSPACE" -czf - . \
-            | kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc '
-                set -euo pipefail
-                rm -rf /workspace/*
-                tar -xzf - -C /workspace
-                ls -lah /workspace | head -n 50
-                touch /workspace/.ready
-              '
+            | timeout 300 kubectl -n "$NAMESPACE" exec -i "$POD" -c fetch-src -- sh -lc 'set -euo pipefail; mkdir -p /workspace; rm -rf /workspace/*; tar -xzf - -C /workspace'
 
+          echo "== ensure Dockerfile, then release =="
+          kubectl -n "$NAMESPACE" exec "$POD" -c fetch-src -- sh -lc '
+            set -e
+            if [ ! -f /workspace/Dockerfile ]; then
+              DF="$(find /workspace -maxdepth 2 -type f \( -name Dockerfile -o -name "Dockerfile.*" \) | head -n 1 || true)"
+              if [ -n "$DF" ]; then
+                cp "$DF" /workspace/Dockerfile
+              else
+                cat >/workspace/Dockerfile << "DF"
+FROM python:3.11-slim
+WORKDIR /app
+COPY ml/ /app/
+RUN if [ -f /app/requirements.txt ]; then pip install --no-cache-dir -r /app/requirements.txt; fi
+ENV MLFLOW_EXPERIMENT_NAME=iris-rf
+CMD ["python","-u","/app/train.py"]
+DF
+              fi
+            fi
+            ls -lah /workspace | head -n 50
+            touch /workspace/.ready
+          '
 
-      # Kaniko 완료 대기 (실패 시 진단)
       - name: Wait for Kaniko build to finish (with diagnostics)
         run: |
           set -e
@@ -119,20 +134,51 @@ jobs:
             exit 1
           fi
 
-      # 학습 Job 적용 (템플릿 치환: __IMAGE__ -> $IMAGE)
-      - name: Apply training Job (MLflow) from template
+      - name: Run training Job (MLflow)
         run: |
+          set -e
+          cat > /tmp/iris-train.yaml <<'K8S'
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: iris-train
+            labels: { app: iris-train }
+          spec:
+            ttlSecondsAfterFinished: 600
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                imagePullSecrets:
+                  - name: ghcr-creds
+                containers:
+                  - name: train
+                    image: __IMAGE__
+                    imagePullPolicy: IfNotPresent
+                    env:
+                      - name: MLFLOW_TRACKING_URI
+                        value: http://mlflow.mlops.svc.cluster.local:5000
+                      - name: MLFLOW_EXPERIMENT_NAME
+                        value: iris-rf
+                      - name: MLFLOW_S3_ENDPOINT_URL
+                        value: http://minio.mlops.svc.cluster.local:9000
+                      - name: AWS_ACCESS_KEY_ID
+                        valueFrom: { secretKeyRef: { name: minio-creds, key: accessKey } }
+                      - name: AWS_SECRET_ACCESS_KEY
+                        valueFrom: { secretKeyRef: { name: minio-creds, key: secretKey } }
+                    resources:
+                      requests: { cpu: "500m", memory: "1Gi" }
+                      limits:   { cpu: "2",    memory: "4Gi" }
+          K8S
+          sed -i "s|__IMAGE__|${IMAGE}|g" /tmp/iris-train.yaml
           kubectl -n "$NAMESPACE" delete job iris-train --ignore-not-found
-          sed "s|__IMAGE__|${IMAGE}|g" k8s/iris-train.yaml.tmpl \
-            | kubectl -n "$NAMESPACE" apply -f -
+          kubectl -n "$NAMESPACE" apply -f /tmp/iris-train.yaml
 
-      # (옵션) 학습 로그 tail — 실패해도 워크플로 계속
       - name: Tail training logs (best-effort)
         continue-on-error: true
         run: |
           kubectl -n "$NAMESPACE" logs -f job/iris-train -c train --since=1s || true
 
-      # 배포 적용 + 이미지 태그 갱신
       - name: Set image and rollout
         run: |
           set -e
