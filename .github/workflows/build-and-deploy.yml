@@ -13,6 +13,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_REPO: nacgyun/mlopsgit
   APP_IMAGE: ghcr.io/nacgyun/mlopsgit
+  # >>> 템플릿 실제 위치로 맞춰라. 파일이 repo 루트면 "." 로 바꿔.
+  K8S_DIR: k8s
 
 jobs:
   train-build:
@@ -23,6 +25,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install kubectl (in-runner)
+        run: |
+          set -e
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/kubectl" \
+            "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x "$HOME/bin/kubectl"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          kubectl version --client
+
+      - name: K8s auth quick check
+        run: |
+          kubectl get ns >/dev/null
+          kubectl -n kube-system get pods | head -n3
+
       - name: Set image tag
         run: |
           echo "TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
@@ -31,7 +48,8 @@ jobs:
       # ---------- (A) Kaniko Build & Push ----------
       - name: Render & apply Kaniko Job
         run: |
-          sed "s|__IMAGE__|${IMAGE}|g" k8s/kaniko-build.yaml.tmpl \
+          test -f "${K8S_DIR}/kaniko-build.yaml.tmpl" || { echo "::error file not found::${K8S_DIR}/kaniko-build.yaml.tmpl"; exit 1; }
+          sed "s|__IMAGE__|${IMAGE}|g" "${K8S_DIR}/kaniko-build.yaml.tmpl" \
           | kubectl -n "${NAMESPACE}" apply -f -
 
       - name: Wait Kaniko pod name
@@ -61,11 +79,12 @@ jobs:
       # ---------- (B) Train Job on the just-built image ----------
       - name: Render & apply Train Job
         run: |
+          test -f "${K8S_DIR}/train-job.yaml.tmpl" || { echo "::error file not found::${K8S_DIR}/train-job.yaml.tmpl"; exit 1; }
           sed \
             -e "s|__IMAGE__|${IMAGE}|g" \
             -e "s|__MLFLOW_URI__|http://mlflow.mlops.svc.cluster.local:5000|g" \
             -e "s|__MODEL_NAME__|light-logreg|g" \
-            k8s/train-job.yaml.tmpl \
+            "${K8S_DIR}/train-job.yaml.tmpl" \
           | kubectl -n "${NAMESPACE}" apply -f -
 
       - name: Wait Train pod name
