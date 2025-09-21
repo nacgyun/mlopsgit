@@ -8,7 +8,7 @@ spec:
     spec:
       restartPolicy: Never
 
-      # 1) 소스가 /workspace 에 준비될 때까지 대기
+      # 1) 소스 준비: GitHub tarball로 해당 커밋을 /workspace 에 풀기
       initContainers:
         - name: fetch-src
           image: alpine:3.20
@@ -16,15 +16,17 @@ spec:
           args:
             - |
               set -e
+              apk add --no-cache curl tar >/dev/null
               mkdir -p /workspace
-              echo "waiting for /workspace/.ready ..."
-              while [ ! -f /workspace/.ready ]; do sleep 1; done
-              echo "ready"
+              echo "download source for __GIT_SHA__"
+              curl -L -o /tmp/src.tgz "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
+              tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
+              ls -al /workspace
           volumeMounts:
             - name: workspace
               mountPath: /workspace
 
-      # 2) Kaniko 실행 (GHCR push)
+      # 2) Kaniko build & push
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:latest
@@ -32,25 +34,20 @@ spec:
           args:
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=ghcr.io/nacgyun/mlopsgit:__TAG__
+            - --destination=__IMAGE__
           volumeMounts:
-            # Kaniko가 읽는 위치에 Docker config(secret) 마운트
             - name: docker-config
-              mountPath: /kaniko/.docker/
-            # 소스 컨텍스트
+              mountPath: /kaniko/.docker/     # => /kaniko/.docker/config.json
             - name: workspace
               mountPath: /workspace
 
       volumes:
-        # kubectl create secret generic ghcr-creds \
-        #   --type=kubernetes.io/dockerconfigjson \
-        #   --from-file=.dockerconfigjson=/tmp/dockerconfig.json
         - name: docker-config
           secret:
             secretName: ghcr-creds
             items:
               - key: .dockerconfigjson
-                path: config.json  # => /kaniko/.docker/config.json
+                path: config.json
         - name: workspace
           emptyDir: {}
 

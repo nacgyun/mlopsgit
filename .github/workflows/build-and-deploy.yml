@@ -18,94 +18,78 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure kubectl exists (install if missing)
+      - name: Install kubectl if missing
         run: |
           set -e
           if ! command -v kubectl >/dev/null 2>&1; then
-            echo "::group::Install kubectl"
-            ARCH=$(uname -m)
-            case "$ARCH" in
-              x86_64)  ARCH=amd64 ;;
-              aarch64) ARCH=arm64 ;;
-            esac
+            ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64;; aarch64) ARCH=arm64;; esac
             curl -sSL -o kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
-            chmod +x kubectl
-            sudo mv kubectl /usr/local/bin/kubectl
-            echo "::endgroup::"
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
           fi
           kubectl version --client=true
 
-      - name: Compute image/tag
+      - name: Set build variables
         run: |
           set -e
-          SHORT_TAG="${GITHUB_SHA::12}"
-          echo "SHORT_TAG=${SHORT_TAG}" >> "$GITHUB_ENV"
-          echo "IMAGE=ghcr.io/nacgyun/mlopsgit:${SHORT_TAG}" >> "$GITHUB_ENV"
+          SHORT_TAG=$(echo "${GITHUB_SHA}" | cut -c1-12)
+          echo "SHORT_TAG=$SHORT_TAG" >> $GITHUB_ENV
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY}:${SHORT_TAG}" >> $GITHUB_ENV
+          echo "GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
+
+      - name: Show variables
+        run: |
+          echo "IMAGE=$IMAGE"
           echo "SHORT_TAG=$SHORT_TAG"
-          echo "IMAGE=ghcr.io/nacgyun/mlopsgit:${SHORT_TAG}"
+          echo "GIT_SHA=$GIT_SHA"
 
       - name: Render Kaniko Job manifest
         run: |
           set -e
           sed -e "s|__IMAGE__|${IMAGE}|g" \
-              -e "s|__TAG__|${SHORT_TAG}|g" \
+              -e "s|__GIT_SHA__|${GIT_SHA}|g" \
             k8s/kaniko-job.yaml.tmpl > k8s/kaniko-job.yaml
           echo "----- k8s/kaniko-job.yaml -----"
           cat k8s/kaniko-job.yaml
-
-      - name: Cleanup previous jobs
-        run: |
-          set -e
-          kubectl -n "${NAMESPACE}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found
-          kubectl -n "${NAMESPACE}" delete job "${TRAIN_JOB_NAME}"  --ignore-not-found
-
-      - name: Apply Kaniko Job
-        run: |
-          set -e
-          kubectl -n "${NAMESPACE}" apply -f k8s/kaniko-job.yaml
-          kubectl -n "${NAMESPACE}" get pods -l job-name="${KANIKO_JOB_NAME}" -o wide
-
-      - name: Upload context into init container
-        run: |
-          set -e
-          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" cp . "$POD":/workspace -c fetch-src
-          kubectl -n "${NAMESPACE}" exec "$POD" -c fetch-src -- sh -lc 'ls -al /workspace'
-
-      - name: Release init (create .ready)
-        run: |
-          set -e
-          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" exec "$POD" -c fetch-src -- sh -lc 'touch /workspace/.ready'
-
-      - name: Wait for Kaniko Job to Succeed
-        run: |
-          set -e
-          kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=20m job/${KANIKO_JOB_NAME}
-          echo "---- Kaniko pod logs (last 300 lines) ----"
-          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" logs "$POD" --tail=300 || true
 
       - name: Render Train Job manifest
         run: |
           set -e
           sed -e "s|__IMAGE__|${IMAGE}|g" \
-              -e "s|__TAG__|${SHORT_TAG}|g" \
+              -e "s|__GIT_SHA__|${GIT_SHA}|g" \
             k8s/train-job.yaml.tmpl > k8s/train-job.yaml
           echo "----- k8s/train-job.yaml -----"
           cat k8s/train-job.yaml
 
+      - name: Cleanup previous jobs
+        run: |
+          set -e
+          kubectl -n "$NAMESPACE" delete job "$KANIKO_JOB_NAME" --ignore-not-found
+          kubectl -n "$NAMESPACE" delete job "$TRAIN_JOB_NAME"  --ignore-not-found
+
+      - name: Apply Kaniko Job
+        run: |
+          set -e
+          kubectl -n "$NAMESPACE" apply -f k8s/kaniko-job.yaml
+          kubectl -n "$NAMESPACE" get pods -l job-name="$KANIKO_JOB_NAME" -o wide
+
+      - name: Wait Kaniko → logs
+        run: |
+          set -e
+          kubectl -n "$NAMESPACE" wait --for=condition=complete --timeout=30m job/${KANIKO_JOB_NAME}
+          POD=$(kubectl -n "$NAMESPACE" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          # initContainer 로그 건드리지 말고 메인 컨테이너만 본다
+          kubectl -n "$NAMESPACE" logs "$POD" --tail=300 || true
+
       - name: Apply Train Job
         run: |
           set -e
-          kubectl -n "${NAMESPACE}" apply -f k8s/train-job.yaml
-          kubectl -n "${NAMESPACE}" get pods -l job-name="${TRAIN_JOB_NAME}" -o wide
+          kubectl -n "$NAMESPACE" apply -f k8s/train-job.yaml
+          kubectl -n "$NAMESPACE" get pods -l job-name="$TRAIN_JOB_NAME" -o wide
 
-      - name: Wait for Train Job to Succeed
+      - name: Wait Train → logs
         run: |
           set -e
-          kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=60m job/${TRAIN_JOB_NAME}
-          echo "---- Train pod logs (last 300 lines) ----"
-          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${TRAIN_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" logs "$POD" --tail=300 || true
+          kubectl -n "$NAMESPACE" wait --for=condition=complete --timeout=60m job/${TRAIN_JOB_NAME}
+          POD=$(kubectl -n "$NAMESPACE" get pod -l job-name="${TRAIN_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "$NAMESPACE" logs "$POD" --tail=300 || true
 
