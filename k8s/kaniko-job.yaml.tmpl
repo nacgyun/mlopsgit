@@ -7,6 +7,8 @@ spec:
   template:
     spec:
       restartPolicy: Never
+
+      # 1) 소스가 /workspace 에 준비될 때까지 대기
       initContainers:
         - name: fetch-src
           image: alpine:3.20
@@ -21,29 +23,34 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+
+      # 2) Kaniko 실행 (GHCR push)
       containers:
         - name: kaniko
-          image: gcr.io/kaniko-project/executor:v1.23.2   # 권장: 명시 버전
-          env:
-            - name: DOCKER_CONFIG
-              value: /kaniko/.docker                      # (명시하고 싶으면; 없어도 동작)
+          image: gcr.io/kaniko-project/executor:latest
+          imagePullPolicy: IfNotPresent
           args:
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=--destination=ghcr.io/nacgyun/mlopsgit-test:${GIT_SHA}
-            # - --skip-push-permission-check              # (원인 파악 중 임시 우회가 필요하면 주석 해제)
+            - --destination=ghcr.io/nacgyun/mlopsgit:__TAG__
           volumeMounts:
+            # Kaniko가 읽는 위치에 Docker config(secret) 마운트
             - name: docker-config
-              mountPath: /kaniko/.docker/                 # => /kaniko/.docker/config.json
+              mountPath: /kaniko/.docker/
+            # 소스 컨텍스트
             - name: workspace
               mountPath: /workspace
+
       volumes:
+        # kubectl create secret generic ghcr-creds \
+        #   --type=kubernetes.io/dockerconfigjson \
+        #   --from-file=.dockerconfigjson=/tmp/dockerconfig.json
         - name: docker-config
           secret:
             secretName: ghcr-creds
             items:
               - key: .dockerconfigjson
-                path: config.json
+                path: config.json  # => /kaniko/.docker/config.json
         - name: workspace
           emptyDir: {}
 
