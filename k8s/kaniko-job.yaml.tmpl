@@ -23,15 +23,18 @@ spec:
               mountPath: /workspace
       containers:
         - name: kaniko
-          image: gcr.io/kaniko-project/executor:latest
+          image: gcr.io/kaniko-project/executor:v1.23.2   # 권장: 명시 버전
+          env:
+            - name: DOCKER_CONFIG
+              value: /kaniko/.docker                      # (명시하고 싶으면; 없어도 동작)
           args:
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=__IMAGE__
-            - --docker-config=/kaniko/.docker/
+            - --destination=__IMAGE__                     # 예: ghcr.io/nacgyun/mlopsgit:__TAG__
+            # - --skip-push-permission-check              # (원인 파악 중 임시 우회가 필요하면 주석 해제)
           volumeMounts:
             - name: docker-config
-              mountPath: /kaniko/.docker/
+              mountPath: /kaniko/.docker/                 # => /kaniko/.docker/config.json
             - name: workspace
               mountPath: /workspace
       volumes:
