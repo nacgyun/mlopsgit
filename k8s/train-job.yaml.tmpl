@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-run
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: train
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          # 컨테이너 안에 소스/의존성이 들어있다는 전제(도커파일에서 COPY . /app 등)
+          workingDir: /app
+          command: ["sh","-lc"]
+          args:
+            - |
+              set -e
+              echo "MLFLOW_TRACKING_URI=$MLFLOW_TRACKING_URI"
+              echo "Start training..."
+              python train.py --register-model __MODEL_NAME__
+              echo "Training done."
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "__MLFLOW_URI__"
+             (MinIO 아티팩트 스토어를 쓰는 경우에만 사용 — 이미 MLflow가 내부에서 처리 중이면 생략 가능)
+             - name: MLFLOW_S3_ENDPOINT_URL
+               value: "http://minio.mlops.svc.cluster.local:9000"
+             - name: AWS_ACCESS_KEY_ID
+               valueFrom:
+                 secretKeyRef:
+                   name: minio-root
+                   key: accesskey
+             - name: AWS_SECRET_ACCESS_KEY
+               valueFrom:
+                 secretKeyRef:
+                   name: minio-root
+                   key: secretkey
+

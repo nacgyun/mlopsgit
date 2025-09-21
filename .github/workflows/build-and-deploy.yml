@@ -1,11 +1,10 @@
-name: Build and Push with Kaniko
+name: Train with MLflow + Build & Push (Kaniko)
 
 on:
   push:
     branches: [ "master", "main" ]
   workflow_dispatch:
 
-# (self-hosted 러너에서 kubectl 사용하므로 별도 권한 설정 불필요)
 permissions:
   contents: read
 
@@ -13,11 +12,13 @@ env:
   NAMESPACE: mlops
   REGISTRY: ghcr.io
   IMAGE_REPO: nacgyun/mlopsgit
+  APP_IMAGE: ghcr.io/nacgyun/mlopsgit
 
 jobs:
-  kaniko-build:
+  train-build:
     runs-on: self-hosted
-    timeout-minutes: 30
+    timeout-minutes: 45
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,63 +26,83 @@ jobs:
       - name: Set image tag
         run: |
           echo "TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
-          echo "IMAGE=${REGISTRY}/${IMAGE_REPO}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "IMAGE=${APP_IMAGE}:${GITHUB_SHA}" >> "$GITHUB_ENV"
 
+      # ---------- (A) Kaniko Build & Push ----------
       - name: Render & apply Kaniko Job
         run: |
-          # __IMAGE__ 치환해서 Job 생성/갱신
-          sed "s|__IMAGE__|${IMAGE}|g" kaniko-build.yaml.tmpl \
+          sed "s|__IMAGE__|${IMAGE}|g" k8s/kaniko-build.yaml.tmpl \
           | kubectl -n "${NAMESPACE}" apply -f -
 
-      - name: Wait until kaniko pod is schedulable and get name
-        id: pod
+      - name: Wait Kaniko pod name
+        id: kaniko
         shell: bash
         run: |
-          # kaniko 파드 뜰 때까지 대기
           for i in {1..60}; do
             POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name=kaniko-build \
               -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-            if [[ -n "$POD" ]]; then
-              # 컨테이너가 생성되기 시작할 때까지 살짝 더 대기
-              kubectl -n "${NAMESPACE}" get pod "$POD"
-              echo "pod_name=$POD" >> "$GITHUB_OUTPUT"
-              break
-            fi
+            [[ -n "$POD" ]] && echo "pod=$POD" >> "$GITHUB_OUTPUT" && break
             sleep 2
           done
-          if [[ -z "${POD}" ]]; then
-            echo "::error::kaniko pod not found"
-            exit 1
-          fi
+          [[ -z "$POD" ]] && { echo "::error::kaniko pod not found"; exit 1; }
 
-      - name: Copy source into /workspace (init container is waiting)
+      - name: Copy source into /workspace & release init
         run: |
-          POD="${{ steps.pod.outputs.pod_name }}"
-          # /workspace로 전체 소스 복사( tar 필요 → alpine 베이스라 ok )
+          POD="${{ steps.kaniko.outputs.pod }}"
           kubectl -n "${NAMESPACE}" cp . "${POD}:/workspace" -c fetch-src
-
-      - name: Release init container (touch .ready)
-        run: |
-          POD="${{ steps.pod.outputs.pod_name }}"
           kubectl -n "${NAMESPACE}" exec -c fetch-src "${POD}" -- sh -lc 'touch /workspace/.ready'
 
-      - name: Stream logs (kaniko)
-        run: |
-          kubectl -n "${NAMESPACE}" logs -f job/kaniko-build -c kaniko
+      - name: Stream Kaniko logs
+        run: kubectl -n "${NAMESPACE}" logs -f job/kaniko-build -c kaniko
 
-      - name: Wait for Job completion
-        run: |
-          kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=20m job/kaniko-build
+      - name: Wait Kaniko Job complete
+        run: kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=20m job/kaniko-build
 
-      - name: On failure, dump pod describe & logs
-        if: failure()
+      # ---------- (B) Train Job on the just-built image ----------
+      - name: Render & apply Train Job
         run: |
-          kubectl -n "${NAMESPACE}" get pods -l job-name=kaniko-build -o wide || true
-          kubectl -n "${NAMESPACE}" describe job/kaniko-build || true
-          kubectl -n "${NAMESPACE}" logs job/kaniko-build --all-containers --tail=-1 || true
+          sed \
+            -e "s|__IMAGE__|${IMAGE}|g" \
+            -e "s|__MLFLOW_URI__|http://mlflow.mlops.svc.cluster.local:5000|g" \
+            -e "s|__MODEL_NAME__|light-logreg|g" \
+            k8s/train-job.yaml.tmpl \
+          | kubectl -n "${NAMESPACE}" apply -f -
 
-      - name: Cleanup
+      - name: Wait Train pod name
+        id: train
+        shell: bash
+        run: |
+          for i in {1..60}; do
+            TPOD=$(kubectl -n "${NAMESPACE}" get pod -l job-name=train-run \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            [[ -n "$TPOD" ]] && echo "pod=$TPOD" >> "$GITHUB_OUTPUT" && break
+            sleep 2
+          done
+          [[ -z "$TPOD" ]] && { echo "::error::train pod not found"; exit 1; }
+
+      - name: Stream Train logs
+        run: kubectl -n "${NAMESPACE}" logs -f job/train-run
+
+      - name: Wait Train Job complete
+        run: kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=20m job/train-run
+
+      # ---------- (C) Cleanup ----------
+      - name: Cleanup (always)
         if: always()
         run: |
           kubectl -n "${NAMESPACE}" delete job kaniko-build --ignore-not-found
+          kubectl -n "${NAMESPACE}" delete job train-run   --ignore-not-found
+
+      # ---------- (D) On failure dump ----------
+      - name: Dump on failure
+        if: failure()
+        run: |
+          echo '--- Kaniko ---'
+          kubectl -n "${NAMESPACE}" get pods -l job-name=kaniko-build -o wide || true
+          kubectl -n "${NAMESPACE}" describe job/kaniko-build || true
+          kubectl -n "${NAMESPACE}" logs job/kaniko-build --all-containers --tail=-1 || true
+          echo '--- Train ---'
+          kubectl -n "${NAMESPACE}" get pods -l job-name=train-run -o wide || true
+          kubectl -n "${NAMESPACE}" describe job/train-run || true
+          kubectl -n "${NAMESPACE}" logs job/train-run --all-containers --tail=-1 || true
 
