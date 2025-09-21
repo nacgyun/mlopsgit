@@ -30,7 +30,7 @@ spec:
           args:
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=__IMAGE__                     # 예: ghcr.io/nacgyun/mlopsgit:__TAG__
+            - --destination=--destination=ghcr.io/nacgyun/mlopsgit-test:${GIT_SHA}
             # - --skip-push-permission-check              # (원인 파악 중 임시 우회가 필요하면 주석 해제)
           volumeMounts:
             - name: docker-config
