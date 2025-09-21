@@ -7,17 +7,12 @@ on:
 
 jobs:
   train-build-run:
-    # 네 런너 라벨 (예: self-hosted + k8s) 유지
     runs-on: [self-hosted, k8s]
 
     env:
       NAMESPACE: mlops
       KANIKO_JOB_NAME: kaniko-build
       TRAIN_JOB_NAME: train-job
-      # 태그는 커밋 해시 12자리
-      TAG: ${{ github.sha }}
-      SHORT_TAG: ${{ github.sha.substr(0,12) }}
-      IMAGE: ghcr.io/nacgyun/mlopsgit:${{ github.sha.substr(0,12) }}
 
     steps:
       - name: Checkout
@@ -40,6 +35,12 @@ jobs:
           fi
           kubectl version --client=true
 
+      - name: Set variables (TAG/SHORT_TAG/IMAGE)
+        run: |
+          echo "TAG=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "SHORT_TAG=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/nacgyun/mlopsgit:${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
       - name: Show build variables
         run: |
           set -e
@@ -47,7 +48,7 @@ jobs:
           echo "SHORT_TAG=${SHORT_TAG}"
           echo "IMAGE=${IMAGE}"
 
-      - name: Render Kaniko Job manifest (sed로 치환)
+      - name: Render Kaniko Job manifest (sed 치환)
         run: |
           set -e
           sed -e "s|__IMAGE__|${IMAGE}|g" \
@@ -56,11 +57,11 @@ jobs:
           echo "----- k8s/kaniko-build.yaml -----"
           cat k8s/kaniko-build.yaml
 
-      - name: Render Train Job manifest (sed로 치환)
+      - name: Render Train Job manifest (sed 치환)
         run: |
           set -e
           sed -e "s|__IMAGE__|${IMAGE}|g" \
-              -e "s|__GIT_SHA__|${{ github.sha }}|g" \
+              -e "s|__GIT_SHA__|${GITHUB_SHA}|g" \
             k8s/train-job.yaml.tmpl > k8s/train-job.yaml
           echo "----- k8s/train-job.yaml -----"
           cat k8s/train-job.yaml
