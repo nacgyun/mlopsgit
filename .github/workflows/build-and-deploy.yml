@@ -43,26 +43,45 @@ jobs:
           echo "image=${{ env.REGISTRY_IMAGE }}:${TAG}" >> $GITHUB_OUTPUT
 
       # Kaniko Job 템플릿 치환(__IMAGE__만 교체)
-      - name: Render Kaniko Job
-        run: |
-          set -e
-          test -f k8s/kaniko-build.yaml.tmpl
-          sed "s|__IMAGE__|${IMAGE}|g" k8s/kaniko-build.yaml.tmpl > k8s/kaniko-build.yaml
-        env:
-          IMAGE: ${{ env.IMAGE }}
-
-      # Kaniko Job 실행 → 대기 → 로그
-      - name: Apply Kaniko Job
+      - name: Render & Apply Kaniko Job (no template)
         run: |
           set -e
           kubectl -n "${NAMESPACE}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found
-          kubectl -n "${NAMESPACE}" apply -f k8s/kaniko-build.yaml
+
+          # Kaniko가 Git 리포를 빌드 컨텍스트로 직접 사용(템플릿/복사 불필요)
+          cat <<'EOF' | envsubst > k8s-kaniko-job.yaml
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${KANIKO_JOB_NAME}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:latest
+                    args:
+                      # Git 리포를 컨텍스트로: 현재 커밋을 정확히 빌드
+                      - --context=git://github.com/nacgyun/mlopsgit.git#${GITHUB_SHA}
+                      - --dockerfile=Dockerfile
+                      - --destination=${IMAGE}
+                    volumeMounts:
+                      - name: docker-config
+                        mountPath: /kaniko/.docker/
+                volumes:
+                  - name: docker-config
+                    secret:
+                      secretName: ghcr-creds
+                      items:
+                        - key: .dockerconfigjson
+                          path: config.json
+          EOF
+
+          kubectl -n "${NAMESPACE}" apply -f k8s-kaniko-job.yaml
           kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=30m "job/${KANIKO_JOB_NAME}"
-          echo "--- Kaniko logs ---"
           kubectl -n "${NAMESPACE}" logs "job/${KANIKO_JOB_NAME}" --all-containers=true
-        env:
-          NAMESPACE: ${{ env.NAMESPACE }}
-          KANIKO_JOB_NAME: ${{ env.KANIKO_JOB_NAME }}
 
       # (중요) 방금 만든 이미지로 train.py 실행 — 쿠버네티스 Job으로 돌림
       # ghcr pull 위해 imagePullSecrets(ghcr-creds) 사용, MLflow URI 주입
