@@ -27,7 +27,10 @@ spec:
           args:
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile
-            - --destination=__IMAGE__
+            - --destination=ghcr.io/nacgyun/mlopsgit:__TAG__   # 전부 소문자
+          env:
+            - name: DOCKER_CONFIG
+              value: /kaniko/.docker
           volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker/
