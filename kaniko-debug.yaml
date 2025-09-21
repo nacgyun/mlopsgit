@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kaniko-debug
+  namespace: mlops
+spec:
+  restartPolicy: Never
+  containers:
+    - name: k
+      image: gcr.io/kaniko-project/executor:latest
+      command: ["sh","-lc","sleep 3600"]
+      volumeMounts:
+        - name: docker-config
+          mountPath: /kaniko/.docker/   # <-- 여기가 Kaniko가 읽는 디렉토리
+  volumes:
+    - name: docker-config
+      secret:
+        secretName: ghcr-creds          # <-- 지금 쓰는 그 시크릿
+        items:
+          - key: .dockerconfigjson
+            path: config.json           # => /kaniko/.docker/config.json 로 생성
+
