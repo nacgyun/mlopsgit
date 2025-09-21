@@ -22,44 +22,36 @@ jobs:
         run: |
           set -e
           if ! command -v kubectl >/dev/null 2>&1; then
-            ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+            echo "::group::Install kubectl"
+            ARCH=$(uname -m)
+            case "$ARCH" in
+              x86_64)  ARCH=amd64 ;;
+              aarch64) ARCH=arm64 ;;
+            esac
             curl -sSL -o kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl"
-            chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/kubectl
+            echo "::endgroup::"
           fi
           kubectl version --client=true
 
-      - name: Set build vars
+      - name: Compute image/tag
         run: |
           set -e
           SHORT_TAG="${GITHUB_SHA::12}"
-          echo "SHORT_TAG=$SHORT_TAG" >> $GITHUB_ENV
-          echo "IMAGE=ghcr.io/nacgyun/mlopsgit:$SHORT_TAG" >> $GITHUB_ENV
+          echo "SHORT_TAG=${SHORT_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/nacgyun/mlopsgit:${SHORT_TAG}" >> "$GITHUB_ENV"
+          echo "SHORT_TAG=$SHORT_TAG"
+          echo "IMAGE=ghcr.io/nacgyun/mlopsgit:${SHORT_TAG}"
 
-      - name: Show build vars
-        run: |
-          echo "GITHUB_SHA=${GITHUB_SHA}"
-          echo "SHORT_TAG=${SHORT_TAG}"
-          echo "IMAGE=${IMAGE}"
-
-      # ⬇️ 템플릿 경로를 'kaniko-job.yaml.tmpl'로 맞춤
-      - name: Render Kaniko Job manifest (sed)
+      - name: Render Kaniko Job manifest
         run: |
           set -e
           sed -e "s|__IMAGE__|${IMAGE}|g" \
               -e "s|__TAG__|${SHORT_TAG}|g" \
-              -e "s|__GIT_SHA__|${GITHUB_SHA}|g" \
-            k8s/kaniko-job.yaml.tmpl > k8s/kaniko-build.yaml
-          echo "----- k8s/kaniko-build.yaml -----"
-          cat k8s/kaniko-build.yaml
-
-      - name: Render Train Job manifest (sed)
-        run: |
-          set -e
-          sed -e "s|__IMAGE__|${IMAGE}|g" \
-              -e "s|__GIT_SHA__|${GITHUB_SHA}|g" \
-            k8s/train-job.yaml.tmpl > k8s/train-job.yaml
-          echo "----- k8s/train-job.yaml -----"
-          cat k8s/train-job.yaml
+            k8s/kaniko-job.yaml.tmpl > k8s/kaniko-job.yaml
+          echo "----- k8s/kaniko-job.yaml -----"
+          cat k8s/kaniko-job.yaml
 
       - name: Cleanup previous jobs
         run: |
@@ -70,16 +62,38 @@ jobs:
       - name: Apply Kaniko Job
         run: |
           set -e
-          kubectl -n "${NAMESPACE}" apply -f k8s/kaniko-build.yaml
+          kubectl -n "${NAMESPACE}" apply -f k8s/kaniko-job.yaml
           kubectl -n "${NAMESPACE}" get pods -l job-name="${KANIKO_JOB_NAME}" -o wide
+
+      - name: Upload context into init container
+        run: |
+          set -e
+          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "${NAMESPACE}" cp . "$POD":/workspace -c fetch-src
+          kubectl -n "${NAMESPACE}" exec "$POD" -c fetch-src -- sh -lc 'ls -al /workspace'
+
+      - name: Release init (create .ready)
+        run: |
+          set -e
+          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "${NAMESPACE}" exec "$POD" -c fetch-src -- sh -lc 'touch /workspace/.ready'
 
       - name: Wait for Kaniko Job to Succeed
         run: |
           set -e
           kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=20m job/${KANIKO_JOB_NAME}
-          echo "---- Kaniko pod logs (last 300) ----"
+          echo "---- Kaniko pod logs (last 300 lines) ----"
           POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "${NAMESPACE}" logs "$POD" --tail=300 || true
+
+      - name: Render Train Job manifest
+        run: |
+          set -e
+          sed -e "s|__IMAGE__|${IMAGE}|g" \
+              -e "s|__TAG__|${SHORT_TAG}|g" \
+            k8s/train-job.yaml.tmpl > k8s/train-job.yaml
+          echo "----- k8s/train-job.yaml -----"
+          cat k8s/train-job.yaml
 
       - name: Apply Train Job
         run: |
@@ -91,7 +105,7 @@ jobs:
         run: |
           set -e
           kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=60m job/${TRAIN_JOB_NAME}
-          echo "---- Train pod logs (last 300) ----"
+          echo "---- Train pod logs (last 300 lines) ----"
           POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${TRAIN_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "${NAMESPACE}" logs "$POD" --tail=300 || true
 
