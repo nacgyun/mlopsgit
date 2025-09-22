@@ -33,8 +33,6 @@ jobs:
           echo "GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
           echo "SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-12)" >> $GITHUB_ENV
           echo "REPO=${GITHUB_REPOSITORY}" >> $GITHUB_ENV
-          # 실행마다 유니크한 Kaniko 잡 이름 (immutable 충돌 방지)
-          echo "KANIKO_JOB_NAME=kaniko-build-${GITHUB_RUN_ID}" >> $GITHUB_ENV
 
       - name: Detect changes for runtime image
         id: changes
@@ -48,8 +46,19 @@ jobs:
       # ===== Kaniko (런타임 이미지 빌드) : 필요한 경우에만 =====
       - name: Render + Apply + Wait Kaniko runtime-build Job
         if: steps.changes.outputs.runtime_image == 'true'
+        env:
+          # 스텝 내부에서 확정: 치환 실패 방지 (빈값이면 즉시 실패)
+          KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
-          set -e
+          set -euxo pipefail
+          : "${KANIKO_JOB_NAME:?KANIKO_JOB_NAME empty}"
+          : "${IMAGE_RUNTIME:?IMAGE_RUNTIME empty}"
+          : "${GIT_SHA:?GIT_SHA empty}"
+
+          echo "KANIKO_JOB_NAME=${KANIKO_JOB_NAME}"
+          echo "IMAGE_RUNTIME=${IMAGE_RUNTIME}"
+          echo "GIT_SHA=${GIT_SHA}"
+
           # 1) 렌더
           sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
               -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
@@ -60,15 +69,13 @@ jobs:
           echo "----- k8s/kaniko-job.yaml (rendered) -----"
           cat k8s/kaniko-job.yaml
 
-          # 2) 플레이스홀더 치환 검증 (미치환시 즉시 실패)
-          if grep -q "__KANIKO_JOB_NAME__\|__IMAGE__\|__DOCKERFILE__\|__GIT_SHA__" k8s/kaniko-job.yaml; then
+          # 2) 플레이스홀더 미치환 체크 → 실패 시 즉시 종료
+          if grep -E "__KANIKO_JOB_NAME__|__IMAGE__|__DOCKERFILE__|__GIT_SHA__" k8s/kaniko-job.yaml; then
             echo "❌ Placeholder not replaced. Aborting."; exit 1
           fi
 
-          # 3) 적용
+          # 3) 적용 + 대기 + 로그
           kubectl -n "$NAMESPACE" apply -f k8s/kaniko-job.yaml
-
-          # 4) 대기 + 로그
           kubectl -n "$NAMESPACE" wait --for=condition=complete --timeout=30m job/${KANIKO_JOB_NAME}
           POD=$(kubectl -n "$NAMESPACE" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "$NAMESPACE" logs "$POD" --tail=300 || true
