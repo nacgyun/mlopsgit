@@ -1,18 +1,27 @@
-# 최소 런타임 이미지: 코드(ml/*)는 컨테이너에 복사하지 않고
-# initContainer가 /workspace 로 체크아웃한 걸 실행
 FROM python:3.11-slim-bookworm
 
-# 네트워크/미러 문제 회피 + 빌드 도구 최소 설치
+# apt가 deb822(/etc/apt/sources.list.d/debian.sources)를 쓰는 환경과
+# 구형 /etc/apt/sources.list 둘 다 대응. http -> https, IPv4 강제, CA 준비
 RUN set -eux; \
-    sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list || true; \
-    echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4; \
-    apt-get update; \
+    # deb822(책임 파일)인 경우: URIs 라인을 https로 교체
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i -E 's|URIs:[[:space:]]*http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    # 구형 sources.list가 존재한다면 그것도 https로
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://|https://|g' /etc/apt/sources.list; \
+    fi; \
+    # IPv4 강제 + CA 깔고 업데이트
+    apt-get update -o Acquire::ForceIPv4=true; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    update-ca-certificates || true; \
+    # 필요한 빌드도구 최소 설치
     apt-get install -y --no-install-recommends build-essential gcc g++; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/app
 
-# 의존성만 이미지에 bake (코드는 /workspace로 마운트됨)
+# 의존성만 bake (코드는 /workspace로 들어옴)
 COPY ml/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
@@ -20,6 +29,5 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     MLFLOW_EXPERIMENT_NAME=iris-rf
 
-# train-job에서 /workspace/ml/train.py 를 호출하므로
 CMD ["python","-V"]
 
