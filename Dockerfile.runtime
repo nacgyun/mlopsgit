@@ -1,8 +1,25 @@
+# 최소 런타임 이미지: 코드(ml/*)는 컨테이너에 복사하지 않고
+# initContainer가 /workspace 로 체크아웃한 걸 실행
 FROM python:3.11-slim-bookworm
+
+# 네트워크/미러 문제 회피 + 빌드 도구 최소 설치
 RUN set -eux; \
-    apt-get update && apt-get install -y --no-install-recommends build-essential gcc g++; \
+    sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list || true; \
+    echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends build-essential gcc g++; \
     rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/app
+
+# 의존성만 이미지에 bake (코드는 /workspace로 마운트됨)
 COPY ml/requirements.txt /tmp/requirements.txt
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r /tmp/requirements.txt
-WORKDIR /workspace
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MLFLOW_EXPERIMENT_NAME=iris-rf
+
+# train-job에서 /workspace/ml/train.py 를 호출하므로
+CMD ["python","-V"]
+

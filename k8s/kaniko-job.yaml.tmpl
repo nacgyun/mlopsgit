@@ -2,8 +2,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: __KANIKO_JOB_NAME__
+  namespace: mlops
   labels:
     app: kaniko-build
+    job-name: __KANIKO_JOB_NAME__
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 600
@@ -25,36 +27,43 @@ spec:
         - name: workspace
           emptyDir: {}
 
-      # 1) 소스 준비: 깃헙 tarball로 특정 커밋을 /workspace 에 풀기
       initContainers:
         - name: fetch-src
           image: alpine:3.20
+          imagePullPolicy: IfNotPresent
           command: ["/bin/sh","-lc"]
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-pat
+                  key: PAT
           args:
             - |
               set -e
               apk add --no-cache curl tar ca-certificates >/dev/null
               update-ca-certificates || true
+
               echo "download source for __GIT_SHA__"
-              curl -sS -L -o /tmp/src.tgz "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
+              curl -sS -L -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -o /tmp/src.tgz "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
+
               mkdir -p /workspace
               tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
+              echo "workspace top (first 50):"
               ls -al /workspace | head -n 50
           volumeMounts:
             - name: workspace
               mountPath: /workspace
 
-      # 2) Kaniko build & push
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:latest
           imagePullPolicy: IfNotPresent
           args:
             - --context=/workspace
-            # 워크플로우에서 /workspace/Dockerfile.runtime 또는 /workspace/Dockerfile 로 치환
-            - --dockerfile=__DOCKERFILE__
-            - --destination=__IMAGE__
-            # 캐시(선택): 레이어 재사용
+            - --dockerfile=__DOCKERFILE__             # /workspace/Dockerfile.runtime 로 치환됨
+            - --destination=__IMAGE__                 # ghcr.io/nacgyun/mlopsgit:runtime 로 치환됨
             - --cache=true
             - --cache-repo=ghcr.io/nacgyun/mlopsgit/cache
           volumeMounts:
