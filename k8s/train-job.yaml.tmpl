@@ -2,19 +2,49 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: train-job
+  namespace: mlops
+  labels:
+    app: train-job
+    git-sha: "__GIT_SHA__"         # ← (A) 라벨로 SHA 남기기
 spec:
   backoffLimit: 0
   template:
+    metadata:
+      labels:
+        app: train-job
+        git-sha: "__GIT_SHA__"     # ← 파드에도 라벨 남기기
     spec:
       restartPolicy: Never
+      volumes:
+        - name: workspace
+          emptyDir: {}
+      initContainers:
+        - name: fetch-src
+          image: alpine/git:2.45
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -e
+              echo "[init] expected SHA: __GIT_SHA__"     # ← (B) 로그에 기대 SHA 남기기
+              git clone https://github.com/nacgyun/mlopsgit /workspace
+              cd /workspace && git checkout __GIT_SHA__
+              echo "[init] checked out to: $(git rev-parse HEAD)"  # ← (C) 실제 체크아웃 SHA 출력
+              head -n 1 /workspace/ml/train.py || true             # ← (D) 변경 확인용 한 줄 출력
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
       containers:
         - name: trainer
-          image: __IMAGE__
-          imagePullPolicy: IfNotPresent
-          command: ["python","-u","train.py"]
+          image: __IMAGE__          # = ghcr.io/<repo>:runtime
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              echo "[trainer] using SHA: __GIT_SHA__"
+              python -u /workspace/ml/train.py
           env:
-            - name: GIT_SHA
-              value: "__GIT_SHA__"
-            - name: MLFLOW_TRACKING_URI
-              value: "http://mlflow:5000"
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: iris-rf
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+      imagePullSecrets:
+        - name: ghcr-creds
 

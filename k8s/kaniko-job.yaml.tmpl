@@ -1,6 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
+  # 기존 워크플로우가 KANIKO_JOB_NAME=kaniko-build 라면 그대로 둬도 OK
   name: kaniko-build
 spec:
   backoffLimit: 0
@@ -8,7 +9,7 @@ spec:
     spec:
       restartPolicy: Never
 
-      # 1) 소스 준비: GitHub tarball로 해당 커밋을 /workspace 에 풀기
+      # 1) 소스 준비: 해당 커밋 tarball을 /workspace 에 풀기
       initContainers:
         - name: fetch-src
           image: alpine:3.20
@@ -33,8 +34,12 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --context=/workspace
-            - --dockerfile=/workspace/Dockerfile
+            # ⬇️ 워크플로우에서 /workspace/Dockerfile.runtime 또는 /workspace/Dockerfile 로 치환
+            - --dockerfile=__DOCKERFILE__
             - --destination=__IMAGE__
+            # 캐시 사용(선택) — 레이어 재사용으로 빠르게
+            - --cache=true
+            - --cache-repo=ghcr.io/nacgyun/mlopsgit/cache
           volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker/     # => /kaniko/.docker/config.json
