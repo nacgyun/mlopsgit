@@ -1,26 +1,31 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: train-job
-  namespace: mlops
+  name: __KANIKO_JOB_NAME__
   labels:
-    app: train-job
-    git-sha: "__GIT_SHA__"
+    app: kaniko-build
 spec:
   backoffLimit: 0
+  ttlSecondsAfterFinished: 600
   template:
     metadata:
       labels:
-        app: train-job
-        git-sha: "__GIT_SHA__"
+        app: kaniko-build
+        job-name: __KANIKO_JOB_NAME__
     spec:
       restartPolicy: Never
 
       volumes:
+        - name: docker-config
+          secret:
+            secretName: ghcr-creds
+            items:
+              - key: .dockerconfigjson
+                path: config.json
         - name: workspace
           emptyDir: {}
 
-      # 비공개 레포 소스 받기: codeload + PAT
+      # 1) 소스 준비: 깃헙 tarball로 특정 커밋을 /workspace 에 풀기
       initContainers:
         - name: fetch-src
           image: alpine:3.20
@@ -30,45 +35,31 @@ spec:
               set -e
               apk add --no-cache curl tar ca-certificates >/dev/null
               update-ca-certificates || true
-
-              echo "[init] expected SHA: __GIT_SHA__"
-
-              # 비공개 레포: Authorization 헤더에 PAT 사용
-              curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                   -L -o /tmp/src.tgz \
-                   "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
-
+              echo "download source for __GIT_SHA__"
+              curl -sS -L -o /tmp/src.tgz "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
               mkdir -p /workspace
               tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
-
-              echo "[init] unpacked, head is:"
-              head -n 1 /workspace/ml/train.py || true
-          env:
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: gh-pat     # 시크릿 이름
-                  key: PAT         # 키 이름
+              ls -al /workspace | head -n 50
           volumeMounts:
             - name: workspace
               mountPath: /workspace
 
+      # 2) Kaniko build & push
       containers:
-        - name: trainer
-          image: __IMAGE__          # = ghcr.io/<repo>:runtime (워크플로우에서 치환)
-          command: ["/bin/sh","-lc"]
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          imagePullPolicy: IfNotPresent
           args:
-            - |
-              echo "[trainer] using SHA: __GIT_SHA__"
-              python -u /workspace/ml/train.py
-          env:
-            - name: MLFLOW_EXPERIMENT_NAME
-              value: iris-rf
+            - --context=/workspace
+            # 워크플로우에서 /workspace/Dockerfile.runtime 또는 /workspace/Dockerfile 로 치환
+            - --dockerfile=__DOCKERFILE__
+            - --destination=__IMAGE__
+            # 캐시(선택): 레이어 재사용
+            - --cache=true
+            - --cache-repo=ghcr.io/nacgyun/mlopsgit/cache
           volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker/   # => /kaniko/.docker/config.json
             - name: workspace
               mountPath: /workspace
-
-      # GHCR가 private이면 필요 (이미 네임스페이스에 시크릿 존재)
-      imagePullSecrets:
-        - name: ghcr-creds
 

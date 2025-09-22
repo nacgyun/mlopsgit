@@ -11,10 +11,7 @@ jobs:
 
     env:
       NAMESPACE: mlops
-      # 런타임 이미지는 코드 없이 의존성만 담긴 고정 태그(:runtime)
       IMAGE_RUNTIME: ghcr.io/${{ github.repository }}:runtime
-      # 잡 이름
-      KANIKO_JOB_NAME: kaniko-runtime-build
       TRAIN_JOB_NAME: train-job
 
     steps:
@@ -36,9 +33,9 @@ jobs:
           echo "GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
           echo "SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-12)" >> $GITHUB_ENV
           echo "REPO=${GITHUB_REPOSITORY}" >> $GITHUB_ENV
-          echo "NAMESPACE=$NAMESPACE  IMAGE_RUNTIME=$IMAGE_RUNTIME"
+          # Kaniko 잡 이름은 매 실행마다 유니크하게 (immutable 충돌 방지)
+          echo "KANIKO_JOB_NAME=kaniko-build-${GITHUB_RUN_ID}" >> $GITHUB_ENV
 
-      # 런타임 이미지가 필요한 변경인지 탐지 (의존성/베이스 바뀔 때만 빌드)
       - name: Detect changes for runtime image
         id: changes
         uses: dorny/paths-filter@v3
@@ -48,28 +45,25 @@ jobs:
               - 'Dockerfile.runtime'
               - 'ml/requirements.txt'
 
-      # Kaniko Job 매니페스트 렌더 (런타임 이미지용)
+      # ===== Kaniko (런타임 이미지 빌드) : 필요한 경우에만 =====
       - name: Render Kaniko runtime-build Job
         if: steps.changes.outputs.runtime_image == 'true'
         run: |
           set -e
-          # 템플릿이 __IMAGE__ (목표 태그) 와 __DOCKERFILE__ (빌드할 Dockerfile 경로)을 받도록 가정
-          sed -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
+          sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
+              -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
               -e "s|__DOCKERFILE__|/workspace/Dockerfile.runtime|g" \
-              k8s/kaniko-job.yaml.tmpl > k8s/kaniko-job.runtime.yaml
-          echo "----- k8s/kaniko-job.runtime.yaml -----"
-          cat k8s/kaniko-job.runtime.yaml
-
-      - name: Cleanup previous Kaniko runtime job
-        if: steps.changes.outputs.runtime_image == 'true'
-        run: |
-          kubectl -n "$NAMESPACE" delete job "$KANIKO_JOB_NAME" --ignore-not-found
+              -e "s|__GIT_SHA__|${GIT_SHA}|g" \
+            k8s/kaniko-job.yaml.tmpl > k8s/kaniko-job.yaml
+          echo "----- k8s/kaniko-job.yaml -----"
+          cat k8s/kaniko-job.yaml
 
       - name: Apply Kaniko runtime-build Job
         if: steps.changes.outputs.runtime_image == 'true'
         run: |
-          kubectl -n "$NAMESPACE" apply -f k8s/kaniko-job.runtime.yaml
-          kubectl -n "$NAMESPACE" get pods -l job-name="$KANIKO_JOB_NAME" -o wide
+          set -e
+          kubectl -n "$NAMESPACE" apply -f k8s/kaniko-job.yaml
+          kubectl -n "$NAMESPACE" get pods -l job-name="${KANIKO_JOB_NAME}" -o wide
 
       - name: Wait Kaniko runtime-build → logs
         if: steps.changes.outputs.runtime_image == 'true'
@@ -79,8 +73,8 @@ jobs:
           POD=$(kubectl -n "$NAMESPACE" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "$NAMESPACE" logs "$POD" --tail=300 || true
 
-      # 항상: Train Job 렌더/실행 — 파드는 git에서 __GIT_SHA__ 커밋을 받아서 /workspace/ml/train.py 실행
-      - name: Render Train Job (git-based code)
+      # ===== Train Job (항상 최신 커밋으로 실행) =====
+      - name: Render Train Job manifest
         run: |
           set -e
           sed -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
@@ -89,12 +83,14 @@ jobs:
           echo "----- k8s/train-job.yaml -----"
           cat k8s/train-job.yaml
 
-      - name: Cleanup previous Train job
+      - name: Cleanup previous Train Job
         run: |
-          kubectl -n "$NAMESPACE" delete job "$TRAIN_JOB_NAME" --ignore-not-found
+          set -e
+          kubectl -n "$NAMESPACE" delete job "$TRAIN_JOB_NAME" --ignore-not-found --wait=true || true
 
       - name: Apply Train Job
         run: |
+          set -e
           kubectl -n "$NAMESPACE" apply -f k8s/train-job.yaml
           kubectl -n "$NAMESPACE" get pods -l job-name="$TRAIN_JOB_NAME" -o wide
 
