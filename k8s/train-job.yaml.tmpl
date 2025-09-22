@@ -5,36 +5,55 @@ metadata:
   namespace: mlops
   labels:
     app: train-job
-    git-sha: "__GIT_SHA__"         # ← (A) 라벨로 SHA 남기기
+    git-sha: "__GIT_SHA__"
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
         app: train-job
-        git-sha: "__GIT_SHA__"     # ← 파드에도 라벨 남기기
+        git-sha: "__GIT_SHA__"
     spec:
       restartPolicy: Never
+
       volumes:
         - name: workspace
           emptyDir: {}
+
+      # 비공개 레포용: 토큰으로 인증하고, alpine에 git 설치해서 clone
       initContainers:
         - name: fetch-src
-          image: alpine/git:2.45
+          image: alpine:3.20
           command: ["/bin/sh","-lc"]
           args:
             - |
               set -e
-              echo "[init] expected SHA: __GIT_SHA__"     # ← (B) 로그에 기대 SHA 남기기
-              git clone https://github.com/nacgyun/mlopsgit /workspace
-              cd /workspace && git checkout __GIT_SHA__
-              echo "[init] checked out to: $(git rev-parse HEAD)"  # ← (C) 실제 체크아웃 SHA 출력
-              head -n 1 /workspace/ml/train.py || true             # ← (D) 변경 확인용 한 줄 출력
+              apk add --no-cache git curl ca-certificates
+              update-ca-certificates || true
+
+              echo "[init] expected SHA: __GIT_SHA__"
+
+              # 비공개 레포: Authorization 헤더에 PAT 주입
+              git -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
+                  clone https://github.com/nacgyun/mlopsgit /workspace
+
+              cd /workspace
+              git checkout __GIT_SHA__
+              echo "[init] checked out to: $(git rev-parse HEAD)"
+              head -n 1 /workspace/ml/train.py || true
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-pat     # <-- 네임스페이스 mlops에 있는 시크릿 이름
+                  key: PAT         # <-- 키 이름(PAT) 확인
           volumeMounts:
-            - { name: workspace, mountPath: /workspace }
+            - name: workspace
+              mountPath: /workspace
+
       containers:
         - name: trainer
-          image: __IMAGE__          # = ghcr.io/<repo>:runtime
+          image: __IMAGE__          # = ghcr.io/<repo>:runtime (워크플로우에서 치환)
           command: ["/bin/sh","-lc"]
           args:
             - |
@@ -44,7 +63,10 @@ spec:
             - name: MLFLOW_EXPERIMENT_NAME
               value: iris-rf
           volumeMounts:
-            - { name: workspace, mountPath: /workspace }
+            - name: workspace
+              mountPath: /workspace
+
+      # GHCR가 private이면 필요 (이미 있으면 유지)
       imagePullSecrets:
         - name: ghcr-creds
 
