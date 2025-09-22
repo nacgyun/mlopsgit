@@ -47,13 +47,12 @@ jobs:
       - name: Render + Apply + Wait Kaniko runtime-build Job
         if: steps.changes.outputs.runtime_image == 'true'
         env:
-          # 스텝 내부에서 확정: 치환 실패 방지 (빈값이면 즉시 실패)
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
           set -euxo pipefail
-          : "${KANIKO_JOB_NAME:?KANIKO_JOB_NAME empty}"
-          : "${IMAGE_RUNTIME:?IMAGE_RUNTIME empty}"
-          : "${GIT_SHA:?GIT_SHA empty}"
+          : "${KANIKO_JOB_NAME:?empty}"
+          : "${IMAGE_RUNTIME:?empty}"
+          : "${GIT_SHA:?empty}"
 
           echo "KANIKO_JOB_NAME=${KANIKO_JOB_NAME}"
           echo "IMAGE_RUNTIME=${IMAGE_RUNTIME}"
