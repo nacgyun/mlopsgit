@@ -20,7 +20,7 @@ spec:
         - name: workspace
           emptyDir: {}
 
-      # 비공개 레포용: 토큰으로 인증하고, alpine에 git 설치해서 clone
+      # 비공개 레포 소스 받기: codeload + PAT
       initContainers:
         - name: fetch-src
           image: alpine:3.20
@@ -28,25 +28,27 @@ spec:
           args:
             - |
               set -e
-              apk add --no-cache git curl ca-certificates
+              apk add --no-cache curl tar ca-certificates >/dev/null
               update-ca-certificates || true
 
               echo "[init] expected SHA: __GIT_SHA__"
 
-              # 비공개 레포: Authorization 헤더에 PAT 주입
-              git -c http.extraHeader="Authorization: Bearer ${GITHUB_TOKEN}" \
-                  clone https://github.com/nacgyun/mlopsgit /workspace
+              # 비공개 레포: Authorization 헤더에 PAT 사용
+              curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                   -L -o /tmp/src.tgz \
+                   "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
 
-              cd /workspace
-              git checkout __GIT_SHA__
-              echo "[init] checked out to: $(git rev-parse HEAD)"
+              mkdir -p /workspace
+              tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
+
+              echo "[init] unpacked, head is:"
               head -n 1 /workspace/ml/train.py || true
           env:
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: gh-pat     # <-- 네임스페이스 mlops에 있는 시크릿 이름
-                  key: PAT         # <-- 키 이름(PAT) 확인
+                  name: gh-pat     # 시크릿 이름
+                  key: PAT         # 키 이름
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -66,7 +68,7 @@ spec:
             - name: workspace
               mountPath: /workspace
 
-      # GHCR가 private이면 필요 (이미 있으면 유지)
+      # GHCR가 private이면 필요 (이미 네임스페이스에 시크릿 존재)
       imagePullSecrets:
         - name: ghcr-creds
 
