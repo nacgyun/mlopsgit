@@ -1,11 +1,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: __KANIKO_JOB_NAME__
-  namespace: mlops
+  name: kaniko-build-__BUILD_ID__
+  namespace: __NAMESPACE__
   labels:
     app: kaniko-build
-    job-name: __KANIKO_JOB_NAME__
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 600
@@ -13,10 +12,10 @@ spec:
     metadata:
       labels:
         app: kaniko-build
-        job-name: __KANIKO_JOB_NAME__
+        job-name: kaniko-build-__BUILD_ID__
     spec:
       restartPolicy: Never
-
+      serviceAccountName: default
       volumes:
         - name: docker-config
           secret:
@@ -26,7 +25,6 @@ spec:
                 path: config.json
         - name: workspace
           emptyDir: {}
-
       initContainers:
         - name: fetch-src
           image: alpine:3.20
@@ -43,15 +41,24 @@ spec:
               set -e
               apk add --no-cache curl tar ca-certificates >/dev/null
               update-ca-certificates || true
-
-              echo "download source for __GIT_SHA__"
+              echo "[init] download source for __GIT_SHA__"
               curl -sS -L -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                -o /tmp/src.tgz "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
-
+                -o /tmp/src.tgz "https://codeload.github.com/__GITHUB_OWNER__/__GITHUB_REPO__/tar.gz/__GIT_SHA__"
               mkdir -p /workspace
               tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
-              echo "workspace top (first 50):"
-              ls -al /workspace | head -n 50
+              echo "[init] workspace listing:"
+              ls -al /workspace | head -n 30
+
+        - name: check-src
+          image: alpine:3.20
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              if [ ! -f /workspace/Dockerfile.runtime ]; then
+                echo "[ERROR] Missing /workspace/Dockerfile.runtime"
+                exit 1
+              fi
+              echo "[check] /workspace/Dockerfile.runtime found OK"
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -62,13 +69,15 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --context=/workspace
-            - --dockerfile=__DOCKERFILE__             # /workspace/Dockerfile.runtime 로 치환됨
-            - --destination=__IMAGE__                 # ghcr.io/nacgyun/mlopsgit:runtime 로 치환됨
+            - --dockerfile=/workspace/Dockerfile.runtime
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
             - --cache=true
-            - --cache-repo=ghcr.io/nacgyun/mlopsgit/cache
+            - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
+            - --verbosity=info
           volumeMounts:
             - name: docker-config
-              mountPath: /kaniko/.docker/   # => /kaniko/.docker/config.json
+              mountPath: /kaniko/.docker/
             - name: workspace
               mountPath: /workspace
 
