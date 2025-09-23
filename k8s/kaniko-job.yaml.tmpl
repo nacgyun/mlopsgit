@@ -36,18 +36,18 @@ spec:
                 secretKeyRef:
                   name: gh-pat
                   key: PAT
-          args:
-            - |
-              set -e
-              apk add --no-cache curl tar ca-certificates >/dev/null
-              update-ca-certificates || true
-              echo "[init] download source for __GIT_SHA__"
-              curl -sS -L -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                -o /tmp/src.tgz "https://codeload.github.com/__GITHUB_OWNER__/__GITHUB_REPO__/tar.gz/__GIT_SHA__"
-              mkdir -p /workspace
-              tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
-              echo "[init] workspace listing:"
-              ls -al /workspace | head -n 30
+	  args:
+  	    - |
+	      set -e
+	      apk add --no-cache curl tar ca-certificates >/dev/null
+	      update-ca-certificates || true
+	      echo "[init] download source for __GIT_SHA__"
+	      curl -sS -L -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+	        -o /tmp/src.tgz "https://codeload.github.com/__GITHUB_OWNER__/__GITHUB_REPO__/tar.gz/__GIT_SHA__"
+	      mkdir -p /workspace
+	      tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
+	      echo "[init] workspace listing:"
+	      ls -al /workspace | head -n 30
 
         - name: check-src
           image: alpine:3.20
