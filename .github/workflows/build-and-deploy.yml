@@ -52,10 +52,18 @@ jobs:
       - name: Check runtime-$SHA tag (and optional buildkey)
         id: tagcheck
         env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # 있으면 read:packages
+          GITHUB_TOKEN: ${{ github.token }}      # 항상 제공됨(레포 read 권한)
         run: |
           set -euo pipefail
-          OWNER="nacgyun"; REPO="mlopsgit"; TOKEN="${GHCR_PAT:-${GITHUB_TOKEN}}"
+          # jq가 없을 수도 있는 self-hosted 대비
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null 2>&1 || true
+            sudo apt-get install -y jq >/dev/null 2>&1 || true
+          fi
+
+          OWNER="nacgyun"; REPO="mlopsgit"
+          TOKEN="${GHCR_PAT:-$GITHUB_TOKEN}"
 
           # BUILD_KEY: Dockerfile.runtime + requirements.txt 해시 (선택)
           if [ -f Dockerfile.runtime ] && [ -f ml/requirements.txt ]; then
@@ -78,7 +86,7 @@ jobs:
             NEED_BUILD=true
           else
             echo "Tag runtime-${GITHUB_SHA} exists."
-            # 네가 제안한 흐름: 태그가 있으면 변경감지 결과에 따름
+            # 태그가 있으면 변경감지 결과에 따름
             if [ "${{ steps.changes.outputs.runtime_image }}" = "true" ]; then
               echo "Changes detected → build required"
               NEED_BUILD=true
