@@ -34,8 +34,9 @@ jobs:
           set -e
           echo "GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
           echo "SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-12)" >> $GITHUB_ENV
+          echo "IMAGE_RUNTIME_SHA=${IMAGE_RUNTIME}-${GITHUB_SHA}" >> $GITHUB_ENV
 
-      # requirements.txt / Dockerfile.runtime / Dockerfile 변경 시에만 Kaniko 실행
+      # 변경감지(있으면만 빌드 트리거에 쓰임)
       - name: Detect changes for runtime image
         id: changes
         uses: dorny/paths-filter@v3
@@ -47,42 +48,83 @@ jobs:
               - 'Dockerfile.runtime'
               - 'Dockerfile'
 
+      # 태그 존재/라벨 점검 → need_build 판정
+      - name: Check runtime-$SHA tag (and optional buildkey)
+        id: tagcheck
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          OWNER="nacgyun"; REPO="mlopsgit"; TOKEN="${GHCR_PAT:-${GITHUB_TOKEN}}"
+
+          # BUILD_KEY: Dockerfile.runtime + requirements.txt 해시 (선택)
+          if [ -f Dockerfile.runtime ] && [ -f ml/requirements.txt ]; then
+            BUILD_KEY="$( (cat Dockerfile.runtime; echo; cat ml/requirements.txt) | sha256sum | awk '{print $1}')"
+          else
+            BUILD_KEY=""
+          fi
+          echo "build_key=${BUILD_KEY}" >> "$GITHUB_OUTPUT"
+
+          # 태그 존재 확인
+          has_tag() {
+            curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list" \
+              | jq -e --arg t "runtime-${GITHUB_SHA}" '.tags[]? | select(.==$t)' >/dev/null
+          }
+
+          NEED_BUILD=false
+          if ! has_tag; then
+            echo "No tag runtime-${GITHUB_SHA} → build required"
+            NEED_BUILD=true
+          else
+            echo "Tag runtime-${GITHUB_SHA} exists."
+            # 네가 제안한 흐름: 태그가 있으면 변경감지 결과에 따름
+            if [ "${{ steps.changes.outputs.runtime_image }}" = "true" ]; then
+              echo "Changes detected → build required"
+              NEED_BUILD=true
+            fi
+          fi
+
+          echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
+
       # ---- Kaniko: 템플릿 렌더 → 검증 → apply ----
       - name: Kaniko runtime-build (render from template → apply)
-        if: steps.changes.outputs.runtime_image == 'true'
+        if: steps.tagcheck.outputs.need_build == 'true'
         env:
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
           set -euxo pipefail
           : "${KANIKO_JOB_NAME:?}"; : "${IMAGE_RUNTIME:?}"; : "${GIT_SHA:?}"; : "${NAMESPACE:?}"
 
-          # 1) 템플릿 치환 → 렌더 파일
+          # 템플릿 렌더 (BUILD_KEY 지원하도록 템플릿에 __BUILD_KEY__ 라벨 자리 한 줄 추가 권장)
           sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
               -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
               -e "s|__DOCKERFILE__|/workspace/Dockerfile.runtime|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
+              -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
           echo "----- rendered kaniko-job -----"
           cat /tmp/kaniko-job.yaml
 
-          # 2) 플레이스홀더 가드
-          if grep -E "__KANIKO_JOB_NAME__|__IMAGE__|__DOCKERFILE__|__GIT_SHA__" /tmp/kaniko-job.yaml; then
+          # placeholder 가드
+          if grep -E "__KANIKO_JOB_NAME__|__IMAGE__|__DOCKERFILE__|__GIT_SHA__|__BUILD_KEY__" /tmp/kaniko-job.yaml; then
             echo "❌ placeholder left in manifest"; exit 1
           fi
 
-          # 3) 같은 이름 job 있으면 삭제 후 적용
+          # 적용
           kubectl -n "${NAMESPACE}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found || true
           kubectl -n "${NAMESPACE}" apply -f /tmp/kaniko-job.yaml
           kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=30m job/${KANIKO_JOB_NAME}
           POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" logs "$POD" --tail=300 || true
+          # 푸시 확인
+          kubectl -n "${NAMESPACE}" logs "$POD" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
-      # ---- Train Job: 항상 최신 git으로 재학습 ----
-      - name: Render Train Job manifest
+      # ---- Train Job: 항상 SHA 태그로 재학습 ----
+      - name: Render Train Job manifest (use SHA tag)
         run: |
           set -e
-          sed -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
+          sed -e "s|__IMAGE__|${IMAGE_RUNTIME_SHA}|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
           echo "----- rendered train-job -----"

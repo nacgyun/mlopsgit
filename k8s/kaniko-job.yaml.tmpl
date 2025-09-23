@@ -68,6 +68,7 @@ spec:
           image: gcr.io/kaniko-project/executor:v1.23.0
           imagePullPolicy: IfNotPresent
           args:
+	    - --label=io.nac.buildkey=__BUILD_KEY__
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile.runtime
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
