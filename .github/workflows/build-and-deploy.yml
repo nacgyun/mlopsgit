@@ -106,9 +106,12 @@ jobs:
 
           # 템플릿 렌더 (BUILD_KEY 지원하도록 템플릿에 __BUILD_KEY__ 라벨 자리 한 줄 추가 권장)
           sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
-              -e "s|__IMAGE__|${IMAGE_RUNTIME}|g" \
+              -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+              -e "s|__GITHUB_OWNER__|nacgyun|g" \
+              -e "s|__GITHUB_REPO__|mlopsgit|g" \
               -e "s|__DOCKERFILE__|/workspace/Dockerfile.runtime|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
+              -e "s|__BUILD_ID__|${{ github.run_id }}|g" \
               -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
