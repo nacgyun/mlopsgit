@@ -1,59 +1,26 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: kaniko-build-__BUILD_ID__
-  namespace: __NAMESPACE__
-  labels:
-    app: kaniko-build
+  name: kaniko-build-123456
+  namespace: mlops
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 600
   template:
-    metadata:
-      labels:
-        app: kaniko-build
-        job-name: kaniko-build-__BUILD_ID__
     spec:
       restartPolicy: Never
-      serviceAccountName: default
       volumes:
-        - name: docker-config
-          secret:
-            secretName: ghcr-creds
-            items:
-              - key: .dockerconfigjson
-                path: config.json
         - name: workspace
           emptyDir: {}
+        - name: docker-config
+          secret:
+            secretName: docker-config  # GHCR 도커 로그인 시 만든 dockerconfigjson 시크릿 이름
       initContainers:
-        - name: fetch-src
-          image: alpine:3.20
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh","-lc"]
-          env:
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: gh-pat
-                  key: PAT
-	  args:
-  	    - |
-	      set -e
-	      apk add --no-cache curl tar ca-certificates >/dev/null
-	      update-ca-certificates || true
-	      echo "[init] download source for __GIT_SHA__"
-	      curl -sS -L -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-	        -o /tmp/src.tgz "https://codeload.github.com/__GITHUB_OWNER__/__GITHUB_REPO__/tar.gz/__GIT_SHA__"
-	      mkdir -p /workspace
-	      tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
-	      echo "[init] workspace listing:"
-	      ls -al /workspace | head -n 30
-
         - name: check-src
           image: alpine:3.20
           command: ["/bin/sh","-c"]
           args:
             - |
+              set -e
               if [ ! -f /workspace/Dockerfile.runtime ]; then
                 echo "[ERROR] Missing /workspace/Dockerfile.runtime"
                 exit 1
@@ -67,13 +34,13 @@ spec:
           image: gcr.io/kaniko-project/executor:v1.23.0
           imagePullPolicy: IfNotPresent
           args:
-            - --label=io.nac.buildkey=__BUILD_KEY__
+            - --label=io.nac.buildkey=991a456fba573c70a34bb80d36d2be31494d3dd34c44021ab402027c300512b0
             - --context=/workspace
             - --dockerfile=/workspace/Dockerfile.runtime
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
+            - --destination=ghcr.io/nacgyun/mlopsgit:runtime
+            - --destination=ghcr.io/nacgyun/mlopsgit:runtime-f2a18438c59419597a9a269d3108ce516d6a229d
             - --cache=true
-            - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
+            - --cache-repo=ghcr.io/nacgyun/mlopsgit/cache
             - --verbosity=info
           volumeMounts:
             - name: docker-config
