@@ -15,6 +15,21 @@ spec:
           secret:
             secretName: docker-config
       initContainers:
+        - name: fetch-src
+          image: alpine/git:2.45.2
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eux
+              git clone --no-checkout https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git /workspace
+              cd /workspace
+              git fetch --depth=1 origin __GIT_SHA__
+              git checkout __GIT_SHA__
+              ls -al
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+
         - name: check-src
           image: alpine:3.20
           command: ["/bin/sh","-c"]
