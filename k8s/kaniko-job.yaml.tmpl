@@ -10,53 +10,22 @@ spec:
       restartPolicy: Never
 
       volumes:
-        - name: workspace
-          emptyDir: {}
         - name: docker-config
           secret:
             secretName: docker-config   # kubectl create secret docker-registry docker-config ...
-
-      initContainers:
-        - name: fetch-src
-          image: alpine/git:2.45.2
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -eux
-              git clone --no-checkout https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git /workspace
-              cd /workspace
-              git fetch --depth=1 origin __GIT_SHA__
-              git checkout __GIT_SHA__
-              ls -al
-
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
-
-        - name: check-src
-          image: alpine:3.20
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -e
-              if [ ! -f __DOCKERFILE__ ]; then
-                echo "[ERROR] Missing __DOCKERFILE__"
-                exit 1
-              fi
-              echo "[check] __DOCKERFILE__ found OK"
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
 
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:v1.23.0
           args:
-            - --label=io.nac.buildkey=__BUILD_KEY__
-            - --context=/workspace
-            - --dockerfile=__DOCKERFILE__
+            # Git 리포를 컨텍스트로 사용 (특정 커밋 SHA 체크아웃)
+            - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
+            # 리포 루트 기준 Dockerfile 경로
+            - --dockerfile=Dockerfile.runtime
+            # 푸시 대상
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
+            # 캐시
             - --cache=true
             - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
             - --verbosity=info
@@ -66,8 +35,6 @@ spec:
           volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker/config.json
-              subPath: .dockerconfigjson     # ← 중요: 파일명으로 마운트
+              subPath: .dockerconfigjson
               readOnly: true
-            - name: workspace
-              mountPath: /workspace
 
