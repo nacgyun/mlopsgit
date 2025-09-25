@@ -10,17 +10,19 @@ spec:
       restartPolicy: Never
       containers:
         - name: trainer
-          image: __IMAGE__
+          image: __IMAGE__          # 예: ghcr.io/nacgyun/mlopsgit:runtime-<BUILD_KEY>
           imagePullPolicy: IfNotPresent
           env:
             - name: GIT_SHA
               value: "__GIT_SHA__"
-            # === MLflow 서버로 직접 기록 ===
+
+            # === MLflow 서버에 직접 기록 ===
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow.mlops.svc.cluster.local:5000
             - name: MLFLOW_EXPERIMENT_NAME
               value: iris-rf
-            # === MinIO를 아티팩트 스토리지로 쓸 때(옵션) ===
+
+            # === MinIO를 MLflow 아티팩트 스토리지로 쓸 때(선택) ===
             - name: MLFLOW_S3_ENDPOINT_URL
               value: http://minio.mlops.svc.cluster.local:9000
             - name: AWS_ACCESS_KEY_ID
@@ -33,6 +35,7 @@ spec:
                 secretKeyRef:
                   name: minio
                   key: secretkey
+
           command: ["/bin/sh","-c"]
           args: |
             set -eux

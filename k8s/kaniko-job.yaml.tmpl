@@ -22,10 +22,10 @@ spec:
             - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
             # 리포 루트 기준 Dockerfile 경로
             - --dockerfile=Dockerfile.runtime
-            # 푸시 대상
+            # 푸시 대상: latest 개념과 컨텐츠 해시(BUILD_KEY) 동시 푸시
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
-            # 캐시
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
+            # Kaniko 캐시
             - --cache=true
             - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
             - --verbosity=info
@@ -33,7 +33,9 @@ spec:
             - name: DOCKER_CONFIG
               value: /kaniko/.docker
           volumeMounts:
+            # docker-registry 시크릿을 config.json 파일로 정확히 마운트
             - name: docker-config
               mountPath: /kaniko/.docker/config.json
               subPath: .dockerconfigjson
               readOnly: true
+
