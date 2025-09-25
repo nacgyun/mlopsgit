@@ -139,10 +139,12 @@ jobs:
           sed -e "s|__IMAGE__|${IMAGE_RUNTIME_SHA}|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
               -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+              -e "s|__GITHUB_OWNER__|${GITHUB_OWNER}|g" \
+              -e "s|__GITHUB_REPO__|${GITHUB_REPO}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
 
           # 렌더 가드
-          if grep -Eq '__(NAMESPACE|IMAGE|GIT_SHA)__' /tmp/train-job.yaml; then
+          if grep -Eq '__(NAMESPACE|IMAGE|GIT_SHA|GITHUB_OWNER|GITHUB_REPO)__' /tmp/train-job.yaml; then
             echo "❌ placeholder left in train-job.yaml"; sed -n '1,200p' /tmp/train-job.yaml; exit 1
           fi
 

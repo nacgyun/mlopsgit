@@ -13,15 +13,28 @@ spec:
         - name: workspace
           emptyDir: {}
 
-      # ⬇️ 소스코드 Git에서 가져오기 (특정 커밋)
+      # Git에서 특정 커밋(__GIT_SHA__) 체크아웃해 코드 제공
       initContainers:
         - name: fetch-src
           image: alpine/git:2.45.2
+          env:
+            # 비공개 레포일 경우용(있으면 사용, 없으면 공개 URL 시도)
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+                  optional: true
           command: ["/bin/sh","-c"]
           args:
             - |
               set -eux
-              git clone --no-checkout https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git /workspace
+              if [ -n "${GITHUB_TOKEN:-}" ]; then
+                GIT_URL="https://oauth2:${GITHUB_TOKEN}@github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git"
+              else
+                GIT_URL="https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git"
+              fi
+              git clone --no-checkout "$GIT_URL" /workspace
               cd /workspace
               git fetch --depth=1 origin __GIT_SHA__
               git checkout __GIT_SHA__
@@ -32,28 +45,36 @@ spec:
 
       containers:
         - name: trainer
-          image: __IMAGE__                 # 예: ghcr.io/nacgyun/mlopsgit:runtime-<BUILD_KEY>
+          image: __IMAGE__   # 예: ghcr.io/<owner>/<repo>:runtime-<BUILD_KEY>
           imagePullPolicy: IfNotPresent
           env:
             - name: GIT_SHA
               value: "__GIT_SHA__"
+            # MLflow Tracking
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow.mlops.svc.cluster.local:5000
             - name: MLFLOW_EXPERIMENT_NAME
               value: iris-rf
+            # (옵션) MinIO를 MLflow Artifact로 사용할 때
             - name: MLFLOW_S3_ENDPOINT_URL
               value: http://minio.mlops.svc.cluster.local:9000
             - name: AWS_ACCESS_KEY_ID
-              valueFrom: { secretKeyRef: { name: minio, key: accesskey } }
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: accesskey
             - name: AWS_SECRET_ACCESS_KEY
-              valueFrom: { secretKeyRef: { name: minio, key: secretkey } }
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: secretkey
 
-          # 가져온 코드를 /opt/app로 마운트하고 그 안에서 실행
           workingDir: /opt/app
           volumeMounts:
             - name: workspace
               mountPath: /opt/app
 
+          # args 파싱 오류 방지를 위해 command 배열만 사용
           command:
             - /bin/sh
             - -lc
