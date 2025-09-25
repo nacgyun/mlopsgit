@@ -1,8 +1,8 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: kaniko-build-123456
-  namespace: mlops
+  name: __KANIKO_JOB_NAME__          # ← 하드코딩 금지, 이 자리표시자 필수
+  namespace: __NAMESPACE__
 spec:
   backoffLimit: 0
   template:
@@ -13,7 +13,7 @@ spec:
           emptyDir: {}
         - name: docker-config
           secret:
-            secretName: docker-config  # GHCR 도커 로그인 시 만든 dockerconfigjson 시크릿 이름
+            secretName: docker-config
       initContainers:
         - name: check-src
           image: alpine:3.20
@@ -32,15 +32,14 @@ spec:
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:v1.23.0
-          imagePullPolicy: IfNotPresent
           args:
-            - --label=io.nac.buildkey=991a456fba573c70a34bb80d36d2be31494d3dd34c44021ab402027c300512b0
+            - --label=io.nac.buildkey=__BUILD_KEY__     # ← 빌드키 자리표시자 있으면 더 좋아
             - --context=/workspace
-            - --dockerfile=/workspace/Dockerfile.runtime
-            - --destination=ghcr.io/nacgyun/mlopsgit:runtime
-            - --destination=ghcr.io/nacgyun/mlopsgit:runtime-f2a18438c59419597a9a269d3108ce516d6a229d
+            - --dockerfile=__DOCKERFILE__               # 예: /workspace/Dockerfile.runtime
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
             - --cache=true
-            - --cache-repo=ghcr.io/nacgyun/mlopsgit/cache
+            - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
             - --verbosity=info
           volumeMounts:
             - name: docker-config
