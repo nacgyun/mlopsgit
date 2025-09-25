@@ -8,9 +8,31 @@ spec:
   template:
     spec:
       restartPolicy: Never
+
+      volumes:
+        - name: workspace
+          emptyDir: {}
+
+      # ⬇️ 소스코드 Git에서 가져오기 (특정 커밋)
+      initContainers:
+        - name: fetch-src
+          image: alpine/git:2.45.2
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eux
+              git clone --no-checkout https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git /workspace
+              cd /workspace
+              git fetch --depth=1 origin __GIT_SHA__
+              git checkout __GIT_SHA__
+              ls -al
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+
       containers:
         - name: trainer
-          image: __IMAGE__
+          image: __IMAGE__                 # 예: ghcr.io/nacgyun/mlopsgit:runtime-<BUILD_KEY>
           imagePullPolicy: IfNotPresent
           env:
             - name: GIT_SHA
@@ -22,20 +44,21 @@ spec:
             - name: MLFLOW_S3_ENDPOINT_URL
               value: http://minio.mlops.svc.cluster.local:9000
             - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: minio
-                  key: accesskey
+              valueFrom: { secretKeyRef: { name: minio, key: accesskey } }
             - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: minio
-                  key: secretkey
+              valueFrom: { secretKeyRef: { name: minio, key: secretkey } }
+
+          # 가져온 코드를 /opt/app로 마운트하고 그 안에서 실행
+          workingDir: /opt/app
+          volumeMounts:
+            - name: workspace
+              mountPath: /opt/app
+
           command:
             - /bin/sh
             - -lc
             - |
               set -eux
-              echo "[trainer] using SHA: __GIT_SHA__"
+              echo "[trainer] using SHA: ${GIT_SHA}"
               python ml/train.py
 
