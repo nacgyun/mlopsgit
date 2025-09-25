@@ -7,21 +7,18 @@ spec:
   backoffLimit: 0
   template:
     spec:
-       containers:
-  	- name: trainer
-     	  image: __IMAGE__
-    	  imagePullPolicy: IfNotPresent
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
           env:
             - name: GIT_SHA
               value: "__GIT_SHA__"
-
-            # === MLflow 서버에 직접 기록 ===
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow.mlops.svc.cluster.local:5000
             - name: MLFLOW_EXPERIMENT_NAME
               value: iris-rf
-
-            # === MinIO를 MLflow 아티팩트 스토리지로 쓸 때(선택) ===
             - name: MLFLOW_S3_ENDPOINT_URL
               value: http://minio.mlops.svc.cluster.local:9000
             - name: AWS_ACCESS_KEY_ID
@@ -34,10 +31,11 @@ spec:
                 secretKeyRef:
                   name: minio
                   key: secretkey
-
-	  command: ["/bin/sh","-lc","set -eux; echo \"[trainer] using SHA: __GIT_SHA__\"; python ml/train.py"]
-          args: |
-            set -eux
-            echo "[trainer] using SHA: __GIT_SHA__"
-            python ml/train.py
+          command:
+            - /bin/sh
+            - -lc
+            - |
+              set -eux
+              echo "[trainer] using SHA: __GIT_SHA__"
+              python ml/train.py
 

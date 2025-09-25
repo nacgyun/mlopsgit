@@ -95,7 +95,7 @@ jobs:
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
       - name: Kaniko runtime-build (render → apply)
-        if: steps.tagcheck.outputs.need_build == 'true'
+        if: steps.tagcheck.outputs.need_build == 'true' && steps.changes.outputs.runtime_image == 'true'
         env:
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
