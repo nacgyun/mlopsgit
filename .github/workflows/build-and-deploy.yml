@@ -12,7 +12,7 @@ jobs:
     env:
       NAMESPACE: mlops
       TRAIN_JOB_NAME: train-job
-      IMAGE_RUNTIME: ghcr.io/nacgyun/mlopsgit:runtime  # base tag (no suffix)
+      IMAGE_RUNTIME: ghcr.io/nacgyun/mlopsgit:runtime
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
 
@@ -37,8 +37,7 @@ jobs:
           echo "GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
           echo "SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-12)" >> $GITHUB_ENV
 
-      # 변경 감지(참고용) — 실제 빌드 결정은 BUILD_KEY 존재 여부로 함
-      - name: Detect changes for runtime image
+      - name: Detect changes for runtime image (ref only)
         id: changes
         uses: dorny/paths-filter@v3
         with:
@@ -49,11 +48,10 @@ jobs:
               - 'Dockerfile.runtime'
               - 'Dockerfile'
 
-      # 태그 존재/컨텐츠 해시 점검 → need_build 판정 (BUILD_KEY 사용)
       - name: Check runtime tag by BUILD_KEY
         id: tagcheck
         env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # GHCR API read 권한 (read:packages 이상)
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 이상 권장
           GITHUB_TOKEN: ${{ github.token }}      # fallback
         run: |
           set -euo pipefail
@@ -69,13 +67,10 @@ jobs:
           # BUILD_KEY: Dockerfile.runtime + ml/requirements.txt 해시
           if [ -f Dockerfile.runtime ] && [ -f ml/requirements.txt ]; then
             BUILD_KEY="$( (cat Dockerfile.runtime; echo; cat ml/requirements.txt) | sha256sum | awk '{print $1}')"
+          elif [ -f Dockerfile.runtime ]; then
+            BUILD_KEY="$(sha256sum Dockerfile.runtime | awk '{print $1}')"
           else
-            # 최소한 Dockerfile.runtime만으로도 계산
-            if [ -f Dockerfile.runtime ]; then
-              BUILD_KEY="$(sha256sum Dockerfile.runtime | awk '{print $1}')"
-            else
-              BUILD_KEY=""
-            fi
+            BUILD_KEY=""
           fi
           echo "build_key=${BUILD_KEY}" >> "$GITHUB_OUTPUT"
 
@@ -89,16 +84,16 @@ jobs:
           if [ -z "${BUILD_KEY}" ]; then
             echo "BUILD_KEY empty → build required"
             NEED_BUILD=true
-          elif ! has_build_tag; then
+          elif has_build_tag; then
+            echo "Tag runtime-${BUILD_KEY} exists → skip build"
+            NEED_BUILD=false
+          else
             echo "No tag runtime-${BUILD_KEY} → build required"
             NEED_BUILD=true
-          else
-            echo "Tag runtime-${BUILD_KEY} exists → skip build"
           fi
 
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
-      # ---- Kaniko: Git 컨텍스트에서 바로 빌드/푸시 (BUILD_KEY 태그) ----
       - name: Kaniko runtime-build (render → apply)
         if: steps.tagcheck.outputs.need_build == 'true'
         env:
@@ -115,16 +110,13 @@ jobs:
               -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
-          # 렌더 가드(placeholder 남았으면 실패)
+          # 렌더 가드
           if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY)__' /tmp/kaniko-job.yaml; then
-            echo "❌ placeholder left in kaniko-job.yaml"; sed -n '1,160p' /tmp/kaniko-job.yaml; exit 1
+            echo "❌ placeholder left in kaniko-job.yaml"; sed -n '1,180p' /tmp/kaniko-job.yaml; exit 1
           fi
 
-          # 드라이런 검증
           kubectl -n "${NAMESPACE}" create --dry-run=client -f /tmp/kaniko-job.yaml -o yaml >/dev/null
-
-          echo "----- rendered kaniko-job -----"
-          sed -n '1,160p' /tmp/kaniko-job.yaml
+          echo "----- rendered kaniko-job -----"; sed -n '1,200p' /tmp/kaniko-job.yaml
 
           kubectl -n "${NAMESPACE}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found || true
           kubectl -n "${NAMESPACE}" apply -f /tmp/kaniko-job.yaml
@@ -133,14 +125,11 @@ jobs:
           POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "${NAMESPACE}" logs "$POD" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
-      # ---- Train Job: 항상 컨텐츠 해시 태그로 실행 ----
-      - name: Compute IMAGE_RUNTIME_SHA from BUILD_KEY (fallback SHA)
+      - name: Compute IMAGE tag (prefer BUILD_KEY; fallback SHA)
         run: |
           set -e
           RKEY="${{ steps.tagcheck.outputs.build_key }}"
-          if [ -z "$RKEY" ]; then
-            RKEY="${GIT_SHA}"
-          fi
+          if [ -z "$RKEY" ]; then RKEY="${GIT_SHA}"; fi
           echo "IMAGE_RUNTIME_KEY=${RKEY}" >> $GITHUB_ENV
           echo "IMAGE_RUNTIME_SHA=${IMAGE_RUNTIME}-${RKEY}" >> $GITHUB_ENV
 
@@ -154,11 +143,10 @@ jobs:
 
           # 렌더 가드
           if grep -Eq '__(NAMESPACE|IMAGE|GIT_SHA)__' /tmp/train-job.yaml; then
-            echo "❌ placeholder left in train-job.yaml"; sed -n '1,160p' /tmp/train-job.yaml; exit 1
+            echo "❌ placeholder left in train-job.yaml"; sed -n '1,200p' /tmp/train-job.yaml; exit 1
           fi
 
-          echo "----- rendered train-job -----"
-          sed -n '1,200p' /tmp/train-job.yaml
+          echo "----- rendered train-job -----"; sed -n '1,220p' /tmp/train-job.yaml
 
       - name: Apply Train Job
         run: |

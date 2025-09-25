@@ -7,11 +7,10 @@ spec:
   backoffLimit: 0
   template:
     spec:
-      restartPolicy: Never
-      containers:
-        - name: trainer
-          image: __IMAGE__          # 예: ghcr.io/nacgyun/mlopsgit:runtime-<BUILD_KEY>
-          imagePullPolicy: IfNotPresent
+       containers:
+  	- name: trainer
+     	  image: __IMAGE__
+    	  imagePullPolicy: IfNotPresent
           env:
             - name: GIT_SHA
               value: "__GIT_SHA__"
@@ -36,7 +35,7 @@ spec:
                   name: minio
                   key: secretkey
 
-          command: ["/bin/sh","-c"]
+	  command: ["/bin/sh","-lc","set -eux; echo \"[trainer] using SHA: __GIT_SHA__\"; python ml/train.py"]
           args: |
             set -eux
             echo "[trainer] using SHA: __GIT_SHA__"
