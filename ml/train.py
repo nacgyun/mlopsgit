@@ -1,4 +1,3 @@
-# ml/train.py
 import os, time, json
 import numpy as np
 import matplotlib
@@ -8,6 +7,7 @@ import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
 from mlflow.tracking import MlflowClient
+from mlflow.exceptions import RestException
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
@@ -21,28 +21,38 @@ EXP_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 # ===== 유틸 =====
-def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 10, sleep: float = 0.5) -> str:
-    exp = client.get_experiment_by_name(name)
-    if exp is not None:
-        return exp.experiment_id
-    exp_id = client.create_experiment(name)
-    for _ in range(retries):
-        try:
-            if client.get_experiment(exp_id):
-                return exp_id
-        except Exception:
-            pass
-        time.sleep(sleep)
+def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 12, sleep: float = 0.4) -> str:
+    """
+    MLflow 서버/스토어 지연 + 동시성(UNIQUE 제약)까지 방어:
+    1) 이름으로 여러 번 조회
+    2) 정말 없으면 생성 시도 (이미 존재 예외는 흡수)
+    3) 다시 이름으로 조회될 때까지 재시도
+    """
     for _ in range(retries):
         exp = client.get_experiment_by_name(name)
         if exp is not None:
             return exp.experiment_id
         time.sleep(sleep)
+
+    try:
+        client.create_experiment(name)
+    except RestException as e:
+        if "RESOURCE_ALREADY_EXISTS" not in str(e) and "UNIQUE constraint failed" not in str(e):
+            raise
+    except Exception:
+        pass
+
+    for _ in range(retries):
+        exp = client.get_experiment_by_name(name)
+        if exp is not None:
+            return exp.experiment_id
+        time.sleep(sleep)
+
     raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
 
 def retry(fn, retries=8, delay=0.3, backoff=1.5):
     last = None
-    for i in range(retries):
+    for _ in range(retries):
         try:
             return fn()
         except Exception as e:
@@ -83,9 +93,7 @@ def main():
     # run 생성 → run_id 확보
     active = mlflow.start_run(experiment_id=exp_id, run_name=RUN_NAME)
     run_id = active.info.run_id
-
-    # 아주 짧게 대기(일부 백엔드에서 run 직후 첫 write 레이스 예방)
-    time.sleep(0.2)
+    time.sleep(0.2)  # run 직후 첫 write 레이스 예방
 
     try:
         # 파라미터 기록
@@ -134,7 +142,7 @@ def main():
             json.dump(input_example, f)
         log_artifact_safe(client, run_id, "input_example.json")
 
-        # 모델 기록 (fluent API는 active run을 사용)
+        # 모델 기록 (active run 에 기록됨)
         mlflow.sklearn.log_model(
             sk_model=clf,
             artifact_path="model",
@@ -143,7 +151,6 @@ def main():
 
         print(f"✅ Train done: acc={acc:.3f}, f1={f1:.3f}, time={train_time:.2f}s")
     finally:
-        # run 종료
         mlflow.end_run()
 
 if __name__ == "__main__":
