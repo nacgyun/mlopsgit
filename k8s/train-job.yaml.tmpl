@@ -2,71 +2,40 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: train-job
-  namespace: mlops
-  labels:
-    app: train-job
-    git-sha: "__GIT_SHA__"
+  namespace: __NAMESPACE__
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 600
   template:
-    metadata:
-      labels:
-        app: train-job
-        git-sha: "__GIT_SHA__"
     spec:
       restartPolicy: Never
-
-      volumes:
-        - name: workspace
-          emptyDir: {}
-
-      initContainers:
-        - name: fetch-src
-          image: alpine:3.20
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh","-lc"]
-          env:
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: gh-pat
-                  key: PAT
-          args:
-            - |
-              set -e
-              apk add --no-cache curl tar ca-certificates >/dev/null
-              update-ca-certificates || true
-
-              echo "[init] expected SHA: __GIT_SHA__"
-              curl -sS -L -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                -o /tmp/src.tgz "https://codeload.github.com/nacgyun/mlopsgit/tar.gz/__GIT_SHA__"
-
-              mkdir -p /workspace
-              tar -xzf /tmp/src.tgz -C /workspace --strip-components=1
-
-              echo "[init] head of train.py:"
-              head -n 1 /workspace/ml/train.py || true
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
-
       containers:
         - name: trainer
-          image: __IMAGE__               # = ghcr.io/nacgyun/mlopsgit:runtime 로 치환됨
+          image: __IMAGE__
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              echo "[trainer] using SHA: __GIT_SHA__"
-              python -u /workspace/ml/train.py
           env:
+            - name: GIT_SHA
+              value: "__GIT_SHA__"
+            # === MLflow 서버로 직접 기록 ===
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow.mlops.svc.cluster.local:5000
             - name: MLFLOW_EXPERIMENT_NAME
               value: iris-rf
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
-
-      imagePullSecrets:
-        - name: ghcr-creds
+            # === MinIO를 아티팩트 스토리지로 쓸 때(옵션) ===
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: http://minio.mlops.svc.cluster.local:9000
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: accesskey
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: secretkey
+          command: ["/bin/sh","-c"]
+          args: |
+            set -eux
+            echo "[trainer] using SHA: __GIT_SHA__"
+            python ml/train.py
 
