@@ -20,9 +20,9 @@ EXP_NAME     = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME     = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 # ===== 공통 유틸 =====
-def retry(fn, retries= Twelve := 12, delay=0.3, backoff=1.5):
+def retry(fn, retries=12, delay=0.3, backoff=1.5):
     last = None
-    for _ in range(Twelve):
+    for _ in range(retries):
         try:
             return fn()
         except Exception as e:
