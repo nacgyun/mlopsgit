@@ -5,7 +5,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import mlflow
+import mlflow as mlmod
 from mlflow.tracking import MlflowClient
 from mlflow.exceptions import RestException
 from sklearn.datasets import load_iris
@@ -20,9 +20,9 @@ EXP_NAME     = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME     = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 # ===== 공통 유틸 =====
-def retry(fn, retries=12, delay=0.3, backoff=1.5):
+def retry(fn, retries= Twelve := 12, delay=0.3, backoff=1.5):
     last = None
-    for _ in range(retries):
+    for _ in range(Twelve):
         try:
             return fn()
         except Exception as e:
@@ -90,9 +90,9 @@ def main():
     tracking_uri = (
         os.getenv("MLFLOW_TRACKING_URI")
         or os.getenv("TRACKING_URI")
-        or mlflow.get_tracking_uri()
+        or mlmod.get_tracking_uri()
     )
-    mlflow.set_tracking_uri(tracking_uri)
+    mlmod.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
 
     # ===== 실험 보장 (이름 기준) =====
@@ -159,8 +159,8 @@ def main():
         tmpdir = tempfile.mkdtemp(prefix="model_")
         try:
             local_model_dir = os.path.join(tmpdir, "model")
-            import mlflow.sklearn
-            mlflow.sklearn.save_model(
+            import mlflow.sklearn as ml_sklearn
+            ml_sklearn.save_model(
                 sk_model=clf,
                 path=local_model_dir,
                 input_example=X_test[:2],
