@@ -20,7 +20,7 @@ EXP_NAME     = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME     = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 # ===== 공통 유틸 =====
-def retry(fn, retries=12, delay=0.3, backoff=1.5, swallow=None):
+def retry(fn, retries=12, delay=0.3, backoff=1.5):
     last = None
     for _ in range(retries):
         try:
@@ -58,14 +58,10 @@ def create_run_with_retry(client: MlflowClient, exp_name: str, run_name: str, re
             time.sleep(sleep)
             continue
         try:
-            run = client.create_run(
+            return client.create_run(
                 experiment_id=exp.experiment_id,
-                tags={
-                    "mlflow.runName": run_name,
-                    "source": "k8s-train-job",
-                },
+                tags={"mlflow.runName": run_name, "source": "k8s-train-job"},
             )
-            return run
         except RestException as e:
             if "RESOURCE_DOES_NOT_EXIST" in str(e) or "No Experiment with id" in str(e):
                 time.sleep(sleep)
