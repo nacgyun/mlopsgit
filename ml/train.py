@@ -39,25 +39,45 @@ def _is_run_not_found(e: Exception) -> bool:
 def _is_exp_id_missing(e: Exception) -> bool:
     return isinstance(e, RestException) and ("No Experiment with id" in str(e) or "RESOURCE_DOES_NOT_EXIST" in str(e))
 
-def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 8, sleep: float = 0.25) -> str:
+def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
+    """
+    1) 이름으로 있으면 즉시 반환
+    2) 없으면 create_experiment로 받은 ID를 '그대로' 확정
+    3) 그 ID가 get_experiment(id)로 보일 때까지 대기 (이름 가시성은 무시)
+    """
+    # 1) 이름으로 이미 있으면 OK
     exp = client.get_experiment_by_name(name)
-    if exp is None:
-        try:
-            client.create_experiment(name)
-        except RestException as e:
-            msg = str(e)
-            if "RESOURCE_ALREADY_EXISTS" not in msg and "UNIQUE constraint failed" not in msg:
-                raise
-        # 재조회
+    if exp is not None:
+        return exp.experiment_id
+
+    # 2) 없으면 생성 → ID 확보
+    exp_id = None
+    try:
+        exp_id = client.create_experiment(name)
+    except RestException as e:
+        msg = str(e)
+        # 경합으로 이미 존재할 수 있음 → 이름 재조회
+        if "RESOURCE_ALREADY_EXISTS" in msg or "UNIQUE constraint failed" in msg:
+            exp = client.get_experiment_by_name(name)
+            if exp is not None:
+                exp_id = exp.experiment_id
+        else:
+            raise
+
+    if exp_id is None and exp is not None:
+        exp_id = exp.experiment_id
+    if exp_id is None:
+        # 마지막 안전망: 짧게 이름 재조회
         for i in range(retries):
             exp = client.get_experiment_by_name(name)
             if exp is not None:
+                exp_id = exp.experiment_id
                 break
             time.sleep(sleep * (1.5 ** i))
-        if exp is None:
-            raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
-    exp_id = exp.experiment_id
-    # id 유효성 검증
+    if exp_id is None:
+        raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
+
+    # 3) ID 가시성 확인 (이름 가시성 말고)
     for i in range(retries):
         try:
             ok = client.get_experiment(exp_id)
@@ -66,11 +86,13 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 8, slee
         except RestException:
             pass
         time.sleep(sleep * (1.5 ** i))
-    # 경합/캐시 이슈 시 이름 재조회
+
+    # 여기까지 안 보이면 다시 이름 조회(마지막 안전망)
     exp = client.get_experiment_by_name(name)
     if exp:
         return exp.experiment_id
     raise RuntimeError(f"Experiment id for '{name}' could not be validated")
+
 
 def create_run_no_visibility_race(client: MlflowClient, exp_name: str, exp_id: str, run_name: str):
     def _try_create(eid: str):
