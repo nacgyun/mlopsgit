@@ -20,13 +20,15 @@ EXP_NAME     = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME     = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 # ===== 공통 유틸 =====
-def retry(fn, retries=12, delay=0.3, backoff=1.5):
+def retry(fn, retries=12, delay=0.3, backoff=1.5, retry_on=lambda e: True):
     last = None
     for _ in range(retries):
         try:
             return fn()
         except Exception as e:
             last = e
+            if not retry_on(e):
+                raise
             time.sleep(delay)
             delay *= backoff
     if last:
@@ -68,12 +70,31 @@ def create_run_no_visibility_race(client: MlflowClient, exp_id: str, run_name: s
         tags={"mlflow.runName": run_name, "source": "k8s-train-job"},
     )
 
+def wait_run_visible(client: MlflowClient, run_id: str, retries: int = 40, sleep: float = 0.25):
+    """Run 생성 직후 캐시/가시성 지연이 끝날 때까지 대기."""
+    for i in range(retries):
+        try:
+            r = client.get_run(run_id)
+            if r and r.info and r.info.run_id == run_id:
+                return
+        except RestException:
+            pass
+        time.sleep(sleep * (1.3 ** i))
+    raise RuntimeError(f"Run {run_id} not visible after retries")
+
+def _is_run_not_found(e: Exception) -> bool:
+    return isinstance(e, RestException) and ("Run with id" in str(e) and "not found" in str(e))
+
 def log_params_safe(client: MlflowClient, run_id: str, params: dict):
     for k, v in params.items():
         retry(lambda: client.log_param(run_id, k, str(v)))
 
 def log_metric_safe(client: MlflowClient, run_id: str, key: str, value: float, step: int | None = None):
-    retry(lambda: client.log_metric(run_id, key, float(value), step=step if step is not None else 0))
+    retry(
+        lambda: client.log_metric(run_id, key, float(value), step=step if step is not None else 0),
+        retries=50, delay=0.2, backoff=1.2,
+        retry_on=lambda e: _is_run_not_found(e) or isinstance(e, RestException)
+    )
 
 def log_artifact_safe(client: MlflowClient, run_id: str, local_path: str, artifact_path: str | None = None):
     retry(lambda: client.log_artifact(run_id, local_path, artifact_path))
@@ -82,7 +103,11 @@ def log_artifacts_safe(client: MlflowClient, run_id: str, local_dir: str, artifa
     retry(lambda: client.log_artifacts(run_id, local_dir, artifact_path))
 
 def set_terminated_safe(client: MlflowClient, run_id: str, status="FINISHED"):
-    retry(lambda: client.set_terminated(run_id, status))
+    retry(
+        lambda: client.set_terminated(run_id, status),
+        retries=30, delay=0.2, backoff=1.2,
+        retry_on=lambda e: _is_run_not_found(e) or isinstance(e, RestException)
+    )
 
 def main():
     # ===== MLflow 연결 =====
@@ -103,9 +128,10 @@ def main():
         iris.data, iris.target, test_size=0.2, random_state=42
     )
 
-    # ===== run 생성: experiment_id로 직접 생성 =====
+    # ===== run 생성: experiment_id로 직접 생성 + 가시성 대기 =====
     run = create_run_no_visibility_race(client, exp_id, RUN_NAME)
     run_id = run.info.run_id
+    wait_run_visible(client, run_id)
 
     try:
         # 파라미터 기록
