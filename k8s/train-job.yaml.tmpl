@@ -9,10 +9,9 @@ spec:
     spec:
       restartPolicy: Never
 
-      # DNS 우회(불안정 회피)
-      dnsPolicy: None
+      # ✅ K8s 내부 도메인(svc.cluster.local) 해석 필요 → ClusterFirst(기본) 유지
+      #    외부 DNS만 쓰지 않도록 nameservers 블록 제거
       dnsConfig:
-        nameservers: ["8.8.8.8","1.1.1.1"]
         options:
           - name: ndots
             value: "1"
