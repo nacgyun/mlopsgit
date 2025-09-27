@@ -2,14 +2,14 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: train-job
-  namespace: mlops
+  namespace: __NAMESPACE__
 spec:
   backoffLimit: 0
   template:
     spec:
       restartPolicy: Never
 
-      # ✅ Pod Spec 레벨
+      # DNS 우회(불안정 회피)
       dnsPolicy: None
       dnsConfig:
         nameservers: ["8.8.8.8","1.1.1.1"]
@@ -21,18 +21,24 @@ spec:
           - name: attempts
             value: "2"
 
+      # GHCR가 private이면 주석 해제하고 secret 이름 맞춰줘
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+
       initContainers:
         - name: fetch-src
           image: alpine/git:2.45.2
+          imagePullPolicy: IfNotPresent
           command: ["/bin/sh","-lc"]
           args:
             - |
               set -euo pipefail
               echo "[fetch-src] start"
-              GIT_URL="${GITHUB_TOKEN:+https://oauth2:${GITHUB_TOKEN}@github.com/nacgyun/mlopsgit.git}"
-              GIT_URL="${GIT_URL:-https://github.com/nacgyun/mlopsgit.git}"
-              SHA="${GIT_SHA:-a4ffb36f17796e5aff1c985d0138d843c23d333d}"
+              GIT_URL="${GITHUB_TOKEN:+https://oauth2:${GITHUB_TOKEN}@github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
+              GIT_URL="${GIT_URL:-https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
+              SHA="__GIT_SHA__"
 
+              # 네트워크 내성
               git config --global http.lowSpeedLimit 1000
               git config --global http.lowSpeedTime 20
               git config --global core.longpaths true
@@ -41,12 +47,14 @@ spec:
               git init
               git remote add origin "$GIT_URL"
 
+              # refs 먼저(가볍게), 실패 시 재시도
               for i in 1 2 3; do
                 git fetch --filter=blob:none --no-tags origin \
                   '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' && break
                 echo "[fetch-src] refs fetch retry $i"; sleep 3
               done
 
+              # 특정 SHA 직접 fetch (얕은복제 한계 회피)
               for i in 1 2 3; do
                 git fetch origin "$SHA" && break
                 echo "[fetch-src] sha fetch retry $i"; sleep 3
@@ -67,7 +75,8 @@ spec:
 
       containers:
         - name: trainer
-          image: ghcr.io/nacgyun/mlopsgit:runtime-<고정 or 해시>
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
           command: ["/bin/sh","-lc"]
           args:
             - |
@@ -76,7 +85,7 @@ spec:
               python ml/train.py
           env:
             - name: GIT_SHA
-              value: "a4ffb36f17796e5aff1c985d0138d843c23d333d"
+              value: "__GIT_SHA__"
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.mlops.svc.cluster.local:5000"
             - name: MLFLOW_EXPERIMENT_NAME
