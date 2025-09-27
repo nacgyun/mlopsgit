@@ -6,8 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import mlflow as mlmod
-from mlflow.tracking import MlflowClient
-from mlflow.exceptions import RestException
+from mlflow.models import infer_signature
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
@@ -16,165 +15,38 @@ from sklearn.linear_model import LogisticRegression  # 간단/가벼운 모델
 # ===== 파라미터 / 설정 =====
 EXP_NAME  = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")  # env가 우선
 RUN_NAME  = (os.getenv("GIT_SHA", "")[:12] or "run")
-LR_C      = float(os.getenv("LR_C", "0.3"))     # 과적합 줄이려 C 낮춤
+LR_C      = float(os.getenv("LR_C", "0.3"))     # 1.0 방지 위해 규제 강화
 LR_MAX_IT = int(os.getenv("LR_MAX_ITER", "200"))
 
-# ===== 공통 유틸 =====
-def retry(fn, retries=12, delay=0.3, backoff=1.5, retry_on=lambda e: True):
-    last = None
-    for _ in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if not retry_on(e):
-                raise
-            time.sleep(delay); delay *= backoff
-    if last:
-        raise last
-
-def _is_run_not_found(e: Exception) -> bool:
-    return isinstance(e, RestException) and ("Run with id" in str(e) and "not found" in str(e))
-
-def _is_exp_id_missing(e: Exception) -> bool:
-    return isinstance(e, RestException) and ("No Experiment with id" in str(e) or "RESOURCE_DOES_NOT_EXIST" in str(e))
-
-def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
-    exp = client.get_experiment_by_name(name)
-    if exp is not None:
-        exp_id = exp.experiment_id
-    else:
-        exp_id = None
-        try:
-            exp_id = client.create_experiment(name)
-        except RestException as e:
-            msg = str(e)
-            if "RESOURCE_ALREADY_EXISTS" in msg or "UNIQUE constraint failed" in msg:
-                exp = client.get_experiment_by_name(name)
-                if exp is not None:
-                    exp_id = exp.experiment_id
-            else:
-                raise
-        if exp_id is None:
-            for i in range(retries):
-                exp = client.get_experiment_by_name(name)
-                if exp is not None:
-                    exp_id = exp.experiment_id
-                    break
-                time.sleep(sleep * (1.5 ** i))
-            if exp_id is None:
-                raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
-
-    for i in range(retries):
-        try:
-            ok = client.get_experiment(exp_id)
-            if ok is not None:
-                return exp_id
-        except RestException:
-            pass
-        time.sleep(sleep * (1.5 ** i))
-
-    exp = client.get_experiment_by_name(name)
-    if exp:
-        return exp.experiment_id
-    raise RuntimeError(f"Experiment id for '{name}' could not be validated")
-
-def create_run_no_visibility_race(client: MlflowClient, exp_name: str, exp_id: str, run_name: str):
-    def _try_create(eid: str):
-        return client.create_run(
-            experiment_id=eid,
-            tags={"mlflow.runName": run_name, "source": "k8s-train-job"},
-        )
-    try:
-        return _try_create(exp_id)
-    except RestException as e:
-        if not _is_exp_id_missing(e):
-            raise
-    for i in range(6):
-        fresh_id = ensure_experiment_id(exp_name, client)
-        try:
-            return _try_create(fresh_id)
-        except RestException as e:
-            if _is_exp_id_missing(e):
-                time.sleep(0.25 * (2 ** i))
-                continue
-            raise
-    raise RuntimeError("Failed to create run: experiment id kept missing")
-
-def wait_run_visible(client: MlflowClient, run_id: str, retries: int = 40, sleep: float = 0.25):
-    for i in range(retries):
-        try:
-            r = client.get_run(run_id)
-            if r and r.info and r.info.run_id == run_id:
-                return
-        except RestException:
-            pass
-        time.sleep(sleep * (1.3 ** i))
-    raise RuntimeError(f"Run {run_id} not visible after retries")
-
-def log_params_safe(client: MlflowClient, run_id: str, params: dict):
-    for k, v in params.items():
-        retry(lambda: client.log_param(run_id, k, str(v)))
-
-def log_metric_safe(client: MlflowClient, run_id: str, key: str, value: float, step: int | None = None):
-    retry(
-        lambda: client.log_metric(run_id, key, float(value), step=step if step is not None else 0),
-        retries=50, delay=0.2, backoff=1.2,
-        retry_on=lambda e: _is_run_not_found(e) or isinstance(e, RestException)
-    )
-
-def log_artifact_safe(client: MlflowClient, run_id: str, local_path: str, artifact_path: str | None = None):
-    retry(lambda: client.log_artifact(run_id, local_path, artifact_path))
-
-def log_artifacts_safe(client: MlflowClient, run_id: str, local_dir: str, artifact_path: str | None = None):
-    retry(lambda: client.log_artifacts(run_id, local_dir, artifact_path))
-
-def list_artifacts_with_retry(client, run_id, path="", retries=20, delay=0.3):
-    last = None
-    for _ in range(retries):
-        try:
-            return client.list_artifacts(run_id, path)
-        except Exception as e:
-            last = e
-            time.sleep(delay); delay *= 1.3
-    if last:
-        raise last
-
-def print_artifacts_tree(client, run_id, base_path=""):
-    items = list_artifacts_with_retry(client, run_id, base_path)
-    print("[artifacts]", base_path or ".", "->", [x.path for x in items])
-
 def main():
-    # ===== MLflow 연결 =====
+    # ===== MLflow 연결 & 실험 설정(Fluent 전용) =====
     tracking_uri = (
         os.getenv("MLFLOW_TRACKING_URI")
         or os.getenv("TRACKING_URI")
         or mlmod.get_tracking_uri()
     )
     mlmod.set_tracking_uri(tracking_uri)
-    client = MlflowClient(tracking_uri=tracking_uri)
+    mlmod.set_experiment(EXP_NAME)  # 없으면 생성, 있으면 선택
 
-    # ===== experiment_id 확보 =====
-    exp_id = ensure_experiment_id(EXP_NAME, client)
-
-    # ===== 데이터 (1.0 방지 위해 테스트 비율↑, 시드 변경) =====
+    # ===== 데이터 (1.0 방지: 테스트 30%, 시드 고정) =====
     iris = load_iris()
     X_train, X_test, y_train, y_test = train_test_split(
         iris.data, iris.target, test_size=0.30, random_state=0
     )
 
-    # ===== run 생성 + 가시성 대기 =====
-    run = create_run_no_visibility_race(client, EXP_NAME, exp_id, RUN_NAME)
-    run_id = run.info.run_id
-    wait_run_visible(client, run_id)
+    # ===== Run 시작 (컨텍스트 내부에서 모든 로깅 수행) =====
+    with mlmod.start_run(run_name=RUN_NAME) as run:
+        run_id = run.info.run_id
+        print(f"[mlflow] run_id={run_id}")
 
-    try:
         # 파라미터 기록
-        log_params_safe(client, run_id, {
+        mlmod.log_params({
             "model": "LogisticRegression",
             "LR_C": LR_C,
             "LR_MAX_ITER": LR_MAX_IT,
             "dataset": "iris",
+            "test_size": 0.30,
+            "random_state": 0,
         })
 
         # ===== 학습 =====
@@ -192,9 +64,9 @@ def main():
         y_pred = clf.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
         f1  = f1_score(y_test, y_pred, average="macro")
-        log_metric_safe(client, run_id, "train_time_sec", train_time)
-        log_metric_safe(client, run_id, "accuracy", acc)
-        log_metric_safe(client, run_id, "f1_score", f1)
+        mlmod.log_metric("train_time_sec", float(train_time))
+        mlmod.log_metric("accuracy", float(acc))
+        mlmod.log_metric("f1_score", float(f1))
 
         # ===== Confusion Matrix → artifact =====
         cm = confusion_matrix(y_test, y_pred)
@@ -211,38 +83,24 @@ def main():
         plt.xlabel("Predicted"); plt.ylabel("True"); plt.tight_layout()
         cm_path = "confusion_matrix.png"
         plt.savefig(cm_path, bbox_inches="tight"); plt.close()
-        log_artifact_safe(client, run_id, cm_path, artifact_path="plots")
+        mlmod.log_artifact(cm_path, artifact_path="plots")
 
-        # ===== 모델: 로컬 저장 후 artifacts로 업로드(Fluent 컨텍스트 비사용) =====
-        import mlflow.sklearn as ml_sklearn
-        tmpdir = tempfile.mkdtemp(prefix="model_")
-        try:
-            save_path = os.path.join(tmpdir, "model")
-            ml_sklearn.save_model(
-                sk_model=clf,
-                path=save_path,
-                input_example=X_test[:2],
-            )
-            log_artifacts_safe(client, run_id, save_path, artifact_path="model")
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+        # ===== 모델 업로드: Fluent log_model (동일 컨텍스트) =====
+        from mlflow import sklearn as ml_sklearn
+        signature = infer_signature(X_train, clf.predict(X_train))
+        ml_sklearn.log_model(
+            sk_model=clf,
+            artifact_path="model",
+            signature=signature,
+            input_example=X_test[:2],
+        )
 
         # (선택) 입력 예시 JSON
         with open("input_example.json", "w") as f:
             json.dump(X_test[:2].tolist(), f)
-        log_artifact_safe(client, run_id, "input_example.json")
-
-        # 업로드 확인(리스트)
-        print_artifacts_tree(client, run_id)           # 루트
-        print_artifacts_tree(client, run_id, "plots")  # 이미지
-        print_artifacts_tree(client, run_id, "model")  # 모델
+        mlmod.log_artifact("input_example.json")
 
         print(f"✅ Train done: acc={acc:.3f}, f1={f1:.3f}, time={train_time:.2f}s")
-
-    finally:
-        retry(lambda: client.set_terminated(run_id, "FINISHED"),
-              retries=30, delay=0.2, backoff=1.2,
-              retry_on=lambda e: _is_run_not_found(e) or isinstance(e, RestException))
 
 if __name__ == "__main__":
     main()
