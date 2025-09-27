@@ -8,15 +8,16 @@ import matplotlib.pyplot as plt
 import mlflow as mlmod
 from mlflow.tracking import MlflowClient
 from mlflow.exceptions import RestException
+from mlflow.models import infer_signature
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-from sklearn.linear_model import LogisticRegression  # ← 간단/가벼운 모델
+from sklearn.linear_model import LogisticRegression  # 간단/가벼운 모델
 
 # ===== 파라미터 / 설정 =====
-EXP_NAME  = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-logreg")
+EXP_NAME  = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")  # 환경변수 있으면 그 이름 사용
 RUN_NAME  = (os.getenv("GIT_SHA", "")[:12] or "run")
-LR_C      = float(os.getenv("LR_C", "0.7"))
+LR_C      = float(os.getenv("LR_C", "0.3"))     # 과적합 줄이려 C 낮춤
 LR_MAX_IT = int(os.getenv("LR_MAX_ITER", "200"))
 
 # ===== 공통 유틸 =====
@@ -42,42 +43,36 @@ def _is_exp_id_missing(e: Exception) -> bool:
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
     """
     1) 이름으로 있으면 즉시 반환
-    2) 없으면 create_experiment로 받은 ID를 '그대로' 확정
-    3) 그 ID가 get_experiment(id)로 보일 때까지 대기 (이름 가시성은 무시)
+    2) 없으면 create_experiment로 받은 ID를 확정
+    3) 그 ID가 get_experiment(id)로 보일 때까지 대기
     """
-    # 1) 이름으로 이미 있으면 OK
     exp = client.get_experiment_by_name(name)
     if exp is not None:
-        return exp.experiment_id
-
-    # 2) 없으면 생성 → ID 확보
-    exp_id = None
-    try:
-        exp_id = client.create_experiment(name)
-    except RestException as e:
-        msg = str(e)
-        # 경합으로 이미 존재할 수 있음 → 이름 재조회
-        if "RESOURCE_ALREADY_EXISTS" in msg or "UNIQUE constraint failed" in msg:
-            exp = client.get_experiment_by_name(name)
-            if exp is not None:
-                exp_id = exp.experiment_id
-        else:
-            raise
-
-    if exp_id is None and exp is not None:
         exp_id = exp.experiment_id
-    if exp_id is None:
-        # 마지막 안전망: 짧게 이름 재조회
-        for i in range(retries):
-            exp = client.get_experiment_by_name(name)
-            if exp is not None:
-                exp_id = exp.experiment_id
-                break
-            time.sleep(sleep * (1.5 ** i))
-    if exp_id is None:
-        raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
+    else:
+        exp_id = None
+        try:
+            exp_id = client.create_experiment(name)
+        except RestException as e:
+            msg = str(e)
+            if "RESOURCE_ALREADY_EXISTS" in msg or "UNIQUE constraint failed" in msg:
+                exp = client.get_experiment_by_name(name)
+                if exp is not None:
+                    exp_id = exp.experiment_id
+            else:
+                raise
+        if exp_id is None:
+            # 마지막 안전망: 짧게 이름 재조회
+            for i in range(retries):
+                exp = client.get_experiment_by_name(name)
+                if exp is not None:
+                    exp_id = exp.experiment_id
+                    break
+                time.sleep(sleep * (1.5 ** i))
+            if exp_id is None:
+                raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
 
-    # 3) ID 가시성 확인 (이름 가시성 말고)
+    # ID 가시성 확인
     for i in range(retries):
         try:
             ok = client.get_experiment(exp_id)
@@ -87,14 +82,14 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
             pass
         time.sleep(sleep * (1.5 ** i))
 
-    # 여기까지 안 보이면 다시 이름 조회(마지막 안전망)
+    # 이름 재조회 마지막 시도
     exp = client.get_experiment_by_name(name)
     if exp:
         return exp.experiment_id
     raise RuntimeError(f"Experiment id for '{name}' could not be validated")
 
-
 def create_run_no_visibility_race(client: MlflowClient, exp_name: str, exp_id: str, run_name: str):
+    """exp_id로 run 생성하되, 'No Experiment with id'면 exp_id 재확보 후 재시도."""
     def _try_create(eid: str):
         return client.create_run(
             experiment_id=eid,
@@ -117,6 +112,7 @@ def create_run_no_visibility_race(client: MlflowClient, exp_name: str, exp_id: s
     raise RuntimeError("Failed to create run: experiment id kept missing")
 
 def wait_run_visible(client: MlflowClient, run_id: str, retries: int = 40, sleep: float = 0.25):
+    """Run 생성 직후 캐시/가시성 지연이 끝날 때까지 대기."""
     for i in range(retries):
         try:
             r = client.get_run(run_id)
@@ -172,10 +168,10 @@ def main():
     # ===== experiment_id 확보 =====
     exp_id = ensure_experiment_id(EXP_NAME, client)
 
-    # ===== 데이터 (간단) =====
+    # ===== 데이터 (조금 더 빡세게 분할해서 1.0 방지) =====
     iris = load_iris()
     X_train, X_test, y_train, y_test = train_test_split(
-        iris.data, iris.target, test_size=0.2, random_state=42
+        iris.data, iris.target, test_size=0.30, random_state=0
     )
 
     # ===== run 생성 + 가시성 대기 =====
@@ -192,11 +188,13 @@ def main():
             "dataset": "iris",
         })
 
-        # ===== 학습 (간단/가벼움, 1.0 점수 방지) =====
+        # ===== 학습 =====
         start = time.time()
         clf = LogisticRegression(
-            multi_class="multinomial", solver="lbfgs",
-            C=LR_C, max_iter=LR_MAX_IT, random_state=42
+            solver="lbfgs",
+            C=LR_C,
+            max_iter=LR_MAX_IT,
+            random_state=42,
         )
         clf.fit(X_train, y_train)
         train_time = time.time() - start
@@ -226,13 +224,16 @@ def main():
         plt.savefig(cm_path, bbox_inches="tight"); plt.close()
         log_artifact_safe(client, run_id, cm_path, artifact_path="plots")
 
-        # ===== 모델 업로드: log_model (서버가 S3로 저장) =====
+        # ===== 모델 업로드: 반드시 활성 run 컨텍스트에서 log_model 사용 =====
+        signature = infer_signature(X_train, clf.predict(X_train))
         import mlflow.sklearn as ml_sklearn
-        ml_sklearn.log_model(
-            sk_model=clf,
-            artifact_path="model",
-            input_example=X_test[:2]
-        )
+        with mlmod.start_run(run_id=run_id):  # Fluent API는 활성 run 필요
+            ml_sklearn.log_model(
+                sk_model=clf,
+                artifact_path="model",
+                signature=signature,
+                input_example=X_test[:2],
+            )
 
         # (선택) 입력 예시 JSON
         with open("input_example.json", "w") as f:
