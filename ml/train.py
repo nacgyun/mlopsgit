@@ -8,14 +8,13 @@ import matplotlib.pyplot as plt
 import mlflow as mlmod
 from mlflow.tracking import MlflowClient
 from mlflow.exceptions import RestException
-from mlflow.models import infer_signature
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from sklearn.linear_model import LogisticRegression  # 간단/가벼운 모델
 
 # ===== 파라미터 / 설정 =====
-EXP_NAME  = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")  # 환경변수 있으면 그 이름 사용
+EXP_NAME  = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")  # env가 우선
 RUN_NAME  = (os.getenv("GIT_SHA", "")[:12] or "run")
 LR_C      = float(os.getenv("LR_C", "0.3"))     # 과적합 줄이려 C 낮춤
 LR_MAX_IT = int(os.getenv("LR_MAX_ITER", "200"))
@@ -41,11 +40,6 @@ def _is_exp_id_missing(e: Exception) -> bool:
     return isinstance(e, RestException) and ("No Experiment with id" in str(e) or "RESOURCE_DOES_NOT_EXIST" in str(e))
 
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
-    """
-    1) 이름으로 있으면 즉시 반환
-    2) 없으면 create_experiment로 받은 ID를 확정
-    3) 그 ID가 get_experiment(id)로 보일 때까지 대기
-    """
     exp = client.get_experiment_by_name(name)
     if exp is not None:
         exp_id = exp.experiment_id
@@ -62,7 +56,6 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
             else:
                 raise
         if exp_id is None:
-            # 마지막 안전망: 짧게 이름 재조회
             for i in range(retries):
                 exp = client.get_experiment_by_name(name)
                 if exp is not None:
@@ -72,7 +65,6 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
             if exp_id is None:
                 raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
 
-    # ID 가시성 확인
     for i in range(retries):
         try:
             ok = client.get_experiment(exp_id)
@@ -82,14 +74,12 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
             pass
         time.sleep(sleep * (1.5 ** i))
 
-    # 이름 재조회 마지막 시도
     exp = client.get_experiment_by_name(name)
     if exp:
         return exp.experiment_id
     raise RuntimeError(f"Experiment id for '{name}' could not be validated")
 
 def create_run_no_visibility_race(client: MlflowClient, exp_name: str, exp_id: str, run_name: str):
-    """exp_id로 run 생성하되, 'No Experiment with id'면 exp_id 재확보 후 재시도."""
     def _try_create(eid: str):
         return client.create_run(
             experiment_id=eid,
@@ -112,7 +102,6 @@ def create_run_no_visibility_race(client: MlflowClient, exp_name: str, exp_id: s
     raise RuntimeError("Failed to create run: experiment id kept missing")
 
 def wait_run_visible(client: MlflowClient, run_id: str, retries: int = 40, sleep: float = 0.25):
-    """Run 생성 직후 캐시/가시성 지연이 끝날 때까지 대기."""
     for i in range(retries):
         try:
             r = client.get_run(run_id)
@@ -168,7 +157,7 @@ def main():
     # ===== experiment_id 확보 =====
     exp_id = ensure_experiment_id(EXP_NAME, client)
 
-    # ===== 데이터 (조금 더 빡세게 분할해서 1.0 방지) =====
+    # ===== 데이터 (1.0 방지 위해 테스트 비율↑, 시드 변경) =====
     iris = load_iris()
     X_train, X_test, y_train, y_test = train_test_split(
         iris.data, iris.target, test_size=0.30, random_state=0
@@ -224,16 +213,19 @@ def main():
         plt.savefig(cm_path, bbox_inches="tight"); plt.close()
         log_artifact_safe(client, run_id, cm_path, artifact_path="plots")
 
-        # ===== 모델 업로드: 반드시 활성 run 컨텍스트에서 log_model 사용 =====
-        signature = infer_signature(X_train, clf.predict(X_train))
+        # ===== 모델: 로컬 저장 후 artifacts로 업로드(Fluent 컨텍스트 비사용) =====
         import mlflow.sklearn as ml_sklearn
-        with mlmod.start_run(run_id=run_id):  # Fluent API는 활성 run 필요
-            ml_sklearn.log_model(
+        tmpdir = tempfile.mkdtemp(prefix="model_")
+        try:
+            save_path = os.path.join(tmpdir, "model")
+            ml_sklearn.save_model(
                 sk_model=clf,
-                artifact_path="model",
-                signature=signature,
+                path=save_path,
                 input_example=X_test[:2],
             )
+            log_artifacts_safe(client, run_id, save_path, artifact_path="model")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
         # (선택) 입력 예시 JSON
         with open("input_example.json", "w") as f:
