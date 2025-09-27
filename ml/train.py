@@ -27,47 +27,46 @@ def retry(fn, retries=12, delay=0.3, backoff=1.5):
             return fn()
         except Exception as e:
             last = e
-            time.sleep(delay); delay *= backoff
+            time.sleep(delay)
+            delay *= backoff
     if last:
         raise last
 
-def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 18, sleep: float = 0.4) -> str:
-    for _ in range(retries):
-        exp = client.get_experiment_by_name(name)
-        if exp is not None:
-            return exp.experiment_id
-        time.sleep(sleep)
+def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 8, sleep: float = 0.25) -> str:
+    """이름 조회 레이스를 최소화해서 experiment_id를 확보한다."""
+    # 1) 이미 있으면 바로 사용
+    exp = client.get_experiment_by_name(name)
+    if exp is not None:
+        return exp.experiment_id
+
+    # 2) 없으면 생성 시도
     try:
-        client.create_experiment(name)
+        exp_id = client.create_experiment(name)
+        return exp_id
     except RestException as e:
-        if "RESOURCE_ALREADY_EXISTS" not in str(e) and "UNIQUE constraint failed" not in str(e):
+        # 동시 생성 경합 등
+        msg = str(e)
+        if "RESOURCE_ALREADY_EXISTS" not in msg and "UNIQUE constraint failed" not in msg:
             raise
     except Exception:
+        # 기타 경합 가능 → 아래 재시도 루프에서 조회
         pass
-    for _ in range(retries):
+
+    # 3) 짧게 조회 재시도하여 id 확보
+    for i in range(retries):
         exp = client.get_experiment_by_name(name)
         if exp is not None:
             return exp.experiment_id
-        time.sleep(sleep)
+        time.sleep(sleep * (1.5 ** i))
+
     raise RuntimeError(f"Failed to ensure experiment '{name}' exists")
 
-def create_run_with_retry(client: MlflowClient, exp_name: str, run_name: str, retries=18, sleep=0.4):
-    for _ in range(retries):
-        exp = client.get_experiment_by_name(exp_name)
-        if exp is None:
-            time.sleep(sleep)
-            continue
-        try:
-            return client.create_run(
-                experiment_id=exp.experiment_id,
-                tags={"mlflow.runName": run_name, "source": "k8s-train-job"},
-            )
-        except RestException as e:
-            if "RESOURCE_DOES_NOT_EXIST" in str(e) or "No Experiment with id" in str(e):
-                time.sleep(sleep)
-                continue
-            raise
-    raise RuntimeError("Failed to create run due to experiment visibility delay")
+def create_run_no_visibility_race(client: MlflowClient, exp_id: str, run_name: str):
+    """이름 조회 대신 experiment_id로 바로 run 생성(가시성 지연 우회)."""
+    return client.create_run(
+        experiment_id=exp_id,
+        tags={"mlflow.runName": run_name, "source": "k8s-train-job"},
+    )
 
 def log_params_safe(client: MlflowClient, run_id: str, params: dict):
     for k, v in params.items():
@@ -95,7 +94,7 @@ def main():
     mlmod.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
 
-    # ===== 실험 보장 (이름 기준) =====
+    # ===== experiment_id 확보 (이름 조회 레이스 방지) =====
     exp_id = ensure_experiment_id(EXP_NAME, client)
 
     # ===== 데이터 =====
@@ -104,8 +103,8 @@ def main():
         iris.data, iris.target, test_size=0.2, random_state=42
     )
 
-    # ===== 러닝 개체 직접 생성 (Fluent 미사용) =====
-    run = create_run_with_retry(client, EXP_NAME, RUN_NAME)
+    # ===== run 생성: experiment_id로 직접 생성 =====
+    run = create_run_no_visibility_race(client, exp_id, RUN_NAME)
     run_id = run.info.run_id
 
     try:
