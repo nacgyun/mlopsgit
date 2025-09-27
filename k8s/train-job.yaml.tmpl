@@ -2,62 +2,87 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: train-job
-  namespace: __NAMESPACE__
+  namespace: mlops
 spec:
   backoffLimit: 0
   template:
     spec:
       restartPolicy: Never
 
-      volumes:
-        - name: workspace
-          emptyDir: {}
+      # ✅ Pod Spec 레벨
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["8.8.8.8","1.1.1.1"]
+        options:
+          - name: ndots
+            value: "1"
+          - name: timeout
+            value: "2"
+          - name: attempts
+            value: "2"
 
-      # Git에서 특정 커밋(__GIT_SHA__) 체크아웃해 코드 제공
       initContainers:
         - name: fetch-src
           image: alpine/git:2.45.2
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              echo "[fetch-src] start"
+              GIT_URL="${GITHUB_TOKEN:+https://oauth2:${GITHUB_TOKEN}@github.com/nacgyun/mlopsgit.git}"
+              GIT_URL="${GIT_URL:-https://github.com/nacgyun/mlopsgit.git}"
+              SHA="${GIT_SHA:-a4ffb36f17796e5aff1c985d0138d843c23d333d}"
+
+              git config --global http.lowSpeedLimit 1000
+              git config --global http.lowSpeedTime 20
+              git config --global core.longpaths true
+
+              mkdir -p /workspace && cd /workspace
+              git init
+              git remote add origin "$GIT_URL"
+
+              for i in 1 2 3; do
+                git fetch --filter=blob:none --no-tags origin \
+                  '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' && break
+                echo "[fetch-src] refs fetch retry $i"; sleep 3
+              done
+
+              for i in 1 2 3; do
+                git fetch origin "$SHA" && break
+                echo "[fetch-src] sha fetch retry $i"; sleep 3
+              done
+
+              git checkout --detach "$SHA"
+              echo "[fetch-src] checked out $SHA"
+              ls -al
           env:
-            # 비공개 레포일 경우용(있으면 사용, 없으면 공개 URL 시도)
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: github-token
                   key: token
-                  optional: true
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -eux
-              if [ -n "${GITHUB_TOKEN:-}" ]; then
-                GIT_URL="https://oauth2:${GITHUB_TOKEN}@github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git"
-              else
-                GIT_URL="https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git"
-              fi
-              git clone --no-checkout "$GIT_URL" /workspace
-              cd /workspace
-              git fetch --depth=1 origin __GIT_SHA__
-              git checkout __GIT_SHA__
-              ls -al
           volumeMounts:
             - name: workspace
               mountPath: /workspace
 
       containers:
         - name: trainer
-          image: __IMAGE__   # 예: ghcr.io/<owner>/<repo>:runtime-<BUILD_KEY>
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/nacgyun/mlopsgit:runtime-<고정 or 해시>
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eux
+              echo "[trainer] using SHA: ${GIT_SHA}"
+              python ml/train.py
           env:
             - name: GIT_SHA
-              value: "__GIT_SHA__"
-            # MLflow Tracking
+              value: "a4ffb36f17796e5aff1c985d0138d843c23d333d"
             - name: MLFLOW_TRACKING_URI
-              value: http://mlflow.mlops.svc.cluster.local:5000
+              value: "http://mlflow.mlops.svc.cluster.local:5000"
             - name: MLFLOW_EXPERIMENT_NAME
-              value: iris-rf
-            # (옵션) MinIO를 MLflow Artifact로 사용할 때
+              value: "iris-rf"
             - name: MLFLOW_S3_ENDPOINT_URL
-              value: http://minio.mlops.svc.cluster.local:9000
+              value: "http://minio.mlops.svc.cluster.local:9000"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -68,28 +93,11 @@ spec:
                 secretKeyRef:
                   name: minio
                   key: secretkey
-
-          workingDir: /opt/app
           volumeMounts:
             - name: workspace
               mountPath: /opt/app
 
-          # args 파싱 오류 방지를 위해 command 배열만 사용
-          command:
-            - /bin/sh
-            - -lc
-            - |
-              set -eux
-              echo "[trainer] using SHA: ${GIT_SHA}"
-              python ml/train.py
-	  dnsPolicy: None
-	  dnsConfig:
-	    nameservers: ["8.8.8.8","1.1.1.1"]
-	    options:
-	      - name: ndots
-	        value: "1"
-	      - name: timeout
-	        value: "2"
-	      - name: attempts
-	        value: "2"
+      volumes:
+        - name: workspace
+          emptyDir: {}
 
