@@ -9,8 +9,6 @@ spec:
     spec:
       restartPolicy: Never
 
-      # ✅ K8s 내부 도메인(svc.cluster.local) 해석 필요 → ClusterFirst(기본) 유지
-      #    외부 DNS만 쓰지 않도록 nameservers 블록 제거
       dnsConfig:
         options:
           - name: ndots
@@ -37,7 +35,6 @@ spec:
               GIT_URL="${GIT_URL:-https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
               SHA="__GIT_SHA__"
 
-              # 네트워크 내성
               git config --global http.lowSpeedLimit 1000
               git config --global http.lowSpeedTime 20
               git config --global core.longpaths true
@@ -46,14 +43,12 @@ spec:
               git init
               git remote add origin "$GIT_URL"
 
-              # refs 먼저(가볍게), 실패 시 재시도
               for i in 1 2 3; do
                 git fetch --filter=blob:none --no-tags origin \
                   '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' && break
                 echo "[fetch-src] refs fetch retry $i"; sleep 3
               done
 
-              # 특정 SHA 직접 fetch (얕은복제 한계 회피)
               for i in 1 2 3; do
                 git fetch origin "$SHA" && break
                 echo "[fetch-src] sha fetch retry $i"; sleep 3
@@ -91,16 +86,16 @@ spec:
               value: "iris-rf"
             - name: MLFLOW_S3_ENDPOINT_URL
               value: "http://minio.mlops.svc.cluster.local:9000"
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: minio
-                  key: accesskey
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: minio
-                  key: secretkey
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-1"
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+            - name: AWS_S3_FORCE_PATH_STYLE
+              value: "true"
+          # ⬇️ 여기서 S3 자격증명(Access/Secret)을 Secret에서 한 번에 주입
+          envFrom:
+            - secretRef:
+                name: s3-mlflow-creds
           volumeMounts:
             - name: workspace
               mountPath: /opt/app
