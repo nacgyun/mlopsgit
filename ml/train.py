@@ -1,5 +1,5 @@
 # ml/train.py
-import os, time, json, math, random
+import os, time, json
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -22,15 +22,18 @@ from sklearn.linear_model import SGDClassifier
 EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
-# 학습 길이/속도 조절용
+# 학습 길이/속도 조절용(환경변수로 변경 가능)
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
 BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "32"))
 SLEEP_SEC       = float(os.getenv("TRAIN_SLEEP_SEC", "0.25"))
 
 # SGD 하이퍼파라미터
-LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))  # L2
-LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))  # 초기 학습률(hint)
+LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))  # L2 강도
+LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))  # (힌트용) 초기 lr
 RANDOM_STATE    = int(os.getenv("SEED", "42"))
+
+# ETA 지수이동평균 파라미터
+EMA_ALPHA       = float(os.getenv("ETA_EMA_ALPHA", "0.2"))  # 0.1~0.3 권장
 
 # ===== 공통 유틸 =====
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
@@ -124,6 +127,7 @@ def main():
             "dataset": "iris",
             "test_size": 0.30,
             "random_state": RANDOM_STATE,
+            "eta_ema_alpha": EMA_ALPHA,
         })
 
         # ===== 분류기 (로지스틱 손실) =====
@@ -131,7 +135,7 @@ def main():
             loss="log_loss",
             penalty="l2",
             alpha=LR_ALPHA,
-            learning_rate="optimal",   # eta0는 힌트로만
+            learning_rate="optimal",   # eta0는 힌트
             random_state=RANDOM_STATE,
             fit_intercept=True,
             max_iter=1,                # partial_fit 루프에서 1스텝씩
@@ -139,37 +143,58 @@ def main():
             tol=None
         )
 
-        # 첫 partial_fit에는 classes 전달 필요
-        # 초기 한 번 가볍게 호출해서 내부 초기화
+        # 첫 partial_fit에는 classes 전달 필요(내부 초기화)
         clf.partial_fit(X_train[:BATCH_SIZE], y_train[:BATCH_SIZE], classes=classes)
 
         # ===== 에폭 루프 =====
         t0 = time.time()
         f1_hist = []
+        ema = None  # epoch compute time EMA
+
         for epoch in range(1, EPOCHS + 1):
+            t_epoch = time.perf_counter()
+
             # 미니배치 학습
             for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True, seed=RANDOM_STATE + epoch):
                 clf.partial_fit(Xb, yb)
 
-            # 평가 및 로깅
+            # 실제 학습 시간(대기 제외)
+            compute_sec = time.perf_counter() - t_epoch
+
+            # 평가/로그
             y_pred = clf.predict(X_test)
             acc = float(accuracy_score(y_test, y_pred))
             f1  = float(f1_score(y_test, y_pred, average="macro"))
-            # 확률 예측이 가능하면 로그로스도 측정
             try:
                 y_proba = clf.predict_proba(X_test)
                 ll = float(log_loss(y_test, y_proba))
             except Exception:
                 ll = float("nan")
 
-            mlmod.log_metrics(
-                {"accuracy": acc, "f1_score": f1, "log_loss": ll, "epoch_time_sec": SLEEP_SEC},
-                step=epoch
-            )
-            f1_hist.append(f1)
-            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} logloss={ll:.4f}")
+            # ETA 계산(지수이동평균)
+            if ema is None:
+                ema = compute_sec
+            else:
+                ema = EMA_ALPHA * compute_sec + (1 - EMA_ALPHA) * ema
+            remaining_epochs = EPOCHS - epoch
+            eta_sec = max(0.0, remaining_epochs * (ema + (SLEEP_SEC if SLEEP_SEC > 0 else 0.0)))
 
-            # 체감 지연(옵션)
+            # 실제 시간 로그: compute / sleep / total + ETA
+            mlmod.log_metrics({
+                "accuracy": acc,
+                "f1_score": f1,
+                "log_loss": ll,
+                "epoch_compute_sec": compute_sec,              # 실제 학습시간
+                "epoch_sleep_sec": SLEEP_SEC,                  # 대기시간
+                "epoch_time_sec": compute_sec + SLEEP_SEC,     # 합계
+                "eta_sec": eta_sec,                            # 남은 시간 추정
+                "progress_pct": 100.0 * epoch / EPOCHS,        # 진행률(%)
+            }, step=epoch)
+
+            f1_hist.append(f1)
+            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} "
+                  f"comp={compute_sec:.3f}s sleep={SLEEP_SEC:.2f}s ETA={eta_sec:.1f}s")
+
             if SLEEP_SEC > 0:
                 time.sleep(SLEEP_SEC)
 
