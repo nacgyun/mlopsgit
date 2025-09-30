@@ -1,5 +1,5 @@
 # ml/train.py
-import os, time, json
+import os, time, json, math, random
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -15,21 +15,25 @@ from mlflow.models import infer_signature
 
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, log_loss
+from sklearn.linear_model import SGDClassifier
 
 # ===== 파라미터 / 설정 =====
-EXP_NAME  = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")  # env가 우선
-RUN_NAME  = (os.getenv("GIT_SHA", "")[:12] or "run")
-LR_C      = float(os.getenv("LR_C", "0.3"))     # 1.0 방지 위해 규제 강화
-LR_MAX_IT = int(os.getenv("LR_MAX_ITER", "200"))
+EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
+RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
+
+# 학습 길이/속도 조절용
+EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
+BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "32"))
+SLEEP_SEC       = float(os.getenv("TRAIN_SLEEP_SEC", "0.25"))
+
+# SGD 하이퍼파라미터
+LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))  # L2
+LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))  # 초기 학습률(hint)
+RANDOM_STATE    = int(os.getenv("SEED", "42"))
 
 # ===== 공통 유틸 =====
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
-    """
-    1) 이름으로 조회해서 있으면 그 id 사용
-    2) 없으면 생성 후, id 가시성(get_experiment) 확인까지 대기
-    """
     exp = client.get_experiment_by_name(name)
     if exp is None:
         exp_id = None
@@ -43,7 +47,6 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
             else:
                 raise
         if exp_id is None:
-            # 이름 가시성 재시도
             for i in range(retries):
                 exp = client.get_experiment_by_name(name)
                 if exp is not None:
@@ -55,7 +58,6 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
     else:
         exp_id = exp.experiment_id
 
-    # id 가시성 확인 (이름 가시성보다 신뢰)
     for i in range(retries):
         try:
             if client.get_experiment(exp_id) is not None:
@@ -64,16 +66,12 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
             pass
         time.sleep(sleep * (1.5 ** i))
 
-    # 마지막 안전망: 이름 재조회
     exp = client.get_experiment_by_name(name)
     if exp:
         return exp.experiment_id
     raise RuntimeError(f"Experiment id for '{name}' could not be validated")
 
 def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: float = 0.3, backoff: float = 1.5):
-    """
-    가끔 REST 가시성 지연으로 'No Experiment with id'가 날 수 있어 짧게 재시도.
-    """
     last = None
     for _ in range(retries):
         try:
@@ -86,59 +84,100 @@ def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: f
     if last:
         raise last
 
+def batch_iter(X, y, batch_size, shuffle=True, seed=None):
+    n = len(X)
+    idx = np.arange(n)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(idx)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        b = idx[start:end]
+        yield X[b], y[b]
+
 def main():
     # ===== MLflow 연결 =====
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or os.getenv("TRACKING_URI") or mlmod.get_tracking_uri()
     mlmod.set_tracking_uri(tracking_uri)
-
-    # Client로 실험 ID 확보(가시성까지 확인)
     client = MlflowClient(tracking_uri=tracking_uri)
     exp_id = ensure_experiment_id(EXP_NAME, client)
 
-    # ===== 데이터 (1.0 방지: 테스트 30%, 시드 고정) =====
+    # ===== 데이터 =====
     iris = load_iris()
     X_train, X_test, y_train, y_test = train_test_split(
         iris.data, iris.target, test_size=0.30, random_state=0
     )
+    classes = np.unique(y_train)
 
-    # ===== Run 시작: experiment_id를 명시하고 Fluent 컨텍스트 사용 =====
+    # ===== Run 시작 =====
     with start_run_with_retry(exp_id, RUN_NAME) as run:
         run_id = run.info.run_id
         print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
 
-        # 파라미터
         mlmod.log_params({
-            "model": "LogisticRegression",
-            "LR_C": LR_C,
-            "LR_MAX_ITER": LR_MAX_IT,
+            "model": "SGDClassifier(logistic)",
+            "epochs": EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "sleep_sec": SLEEP_SEC,
+            "alpha": LR_ALPHA,
+            "eta0_hint": LR_INITIAL,
             "dataset": "iris",
             "test_size": 0.30,
-            "random_state": 0,
+            "random_state": RANDOM_STATE,
         })
 
-        # ===== 학습 =====
-        t0 = time.time()
-        clf = LogisticRegression(
-            solver="lbfgs",
-            C=LR_C,
-            max_iter=LR_MAX_IT,
-            random_state=42,
+        # ===== 분류기 (로지스틱 손실) =====
+        clf = SGDClassifier(
+            loss="log_loss",
+            penalty="l2",
+            alpha=LR_ALPHA,
+            learning_rate="optimal",   # eta0는 힌트로만
+            random_state=RANDOM_STATE,
+            fit_intercept=True,
+            max_iter=1,                # partial_fit 루프에서 1스텝씩
+            warm_start=False,
+            tol=None
         )
-        clf.fit(X_train, y_train)
-        train_time = time.time() - t0
 
-        # 메트릭
-        y_pred = clf.predict(X_test)
-        acc = float(accuracy_score(y_test, y_pred))
-        f1  = float(f1_score(y_test, y_pred, average="macro"))
-        mlmod.log_metrics({
-            "train_time_sec": train_time,
-            "accuracy": acc,
-            "f1_score": f1,
-        })
+        # 첫 partial_fit에는 classes 전달 필요
+        # 초기 한 번 가볍게 호출해서 내부 초기화
+        clf.partial_fit(X_train[:BATCH_SIZE], y_train[:BATCH_SIZE], classes=classes)
+
+        # ===== 에폭 루프 =====
+        t0 = time.time()
+        f1_hist = []
+        for epoch in range(1, EPOCHS + 1):
+            # 미니배치 학습
+            for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True, seed=RANDOM_STATE + epoch):
+                clf.partial_fit(Xb, yb)
+
+            # 평가 및 로깅
+            y_pred = clf.predict(X_test)
+            acc = float(accuracy_score(y_test, y_pred))
+            f1  = float(f1_score(y_test, y_pred, average="macro"))
+            # 확률 예측이 가능하면 로그로스도 측정
+            try:
+                y_proba = clf.predict_proba(X_test)
+                ll = float(log_loss(y_test, y_proba))
+            except Exception:
+                ll = float("nan")
+
+            mlmod.log_metrics(
+                {"accuracy": acc, "f1_score": f1, "log_loss": ll, "epoch_time_sec": SLEEP_SEC},
+                step=epoch
+            )
+            f1_hist.append(f1)
+            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} logloss={ll:.4f}")
+
+            # 체감 지연(옵션)
+            if SLEEP_SEC > 0:
+                time.sleep(SLEEP_SEC)
+
+        train_time = time.time() - t0
+        mlmod.log_metric("train_time_total_sec", train_time)
 
         # ===== Confusion Matrix → artifact =====
-        cm = confusion_matrix(y_test, y_pred)
+        cm = confusion_matrix(y_test, clf.predict(X_test))
         plt.figure(figsize=(5, 4))
         im = plt.imshow(cm, interpolation="nearest")
         plt.title("Confusion Matrix")
@@ -154,7 +193,16 @@ def main():
         plt.savefig(cm_path, bbox_inches="tight"); plt.close()
         mlmod.log_artifact(cm_path, artifact_path="plots")
 
-        # ===== 모델 업로드: Fluent log_model (동일 컨텍스트) =====
+        # ===== Learning Curve(에폭별 f1) → artifact =====
+        plt.figure(figsize=(6, 3.5))
+        plt.plot(range(1, len(f1_hist)+1), f1_hist, marker="o")
+        plt.title("F1 over Epochs")
+        plt.xlabel("Epoch"); plt.ylabel("F1 (macro)"); plt.grid(True, alpha=0.3)
+        lc_path = "learning_curve_f1.png"
+        plt.savefig(lc_path, bbox_inches="tight"); plt.close()
+        mlmod.log_artifact(lc_path, artifact_path="plots")
+
+        # ===== 모델 업로드 =====
         from mlflow import sklearn as ml_sklearn
         signature = infer_signature(X_train, clf.predict(X_train))
         ml_sklearn.log_model(
@@ -164,12 +212,11 @@ def main():
             input_example=X_test[:2],
         )
 
-        # (선택) 입력 예시 JSON
         with open("input_example.json", "w") as f:
             json.dump(X_test[:2].tolist(), f)
         mlmod.log_artifact("input_example.json")
 
-        print(f"✅ Train done: acc={acc:.3f}, f1={f1:.3f}, time={train_time:.2f}s")
+        print(f"✅ Train done: epochs={EPOCHS}, total_time={train_time:.2f}s")
 
 if __name__ == "__main__":
     main()
