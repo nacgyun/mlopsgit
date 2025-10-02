@@ -6,34 +6,32 @@ metadata:
 spec:
   backoffLimit: 0
   template:
+    metadata:
+      labels:
+        allow-egress-internet: "true"   # ← egress 허용 라벨
     spec:
       restartPolicy: Never
-
       volumes:
         - name: docker-config
           secret:
-            secretName: docker-config   # kubectl create secret docker-registry docker-config ...
-
+            secretName: docker-config
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:v1.23.0
           args:
-            # Git 리포를 컨텍스트로 사용 (특정 커밋 SHA 체크아웃)
             - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
-            # 리포 루트 기준 Dockerfile 경로
             - --dockerfile=Dockerfile.runtime
-            # 푸시 대상: latest 개념과 컨텐츠 해시(BUILD_KEY) 동시 푸시
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
-            # Kaniko 캐시
             - --cache=true
             - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
             - --verbosity=info
           env:
+            - name: GODEBUG
+              value: "ipv6=0"               # ← IPv6 강제 비활성화 (Go 런타임)
             - name: DOCKER_CONFIG
               value: /kaniko/.docker
           volumeMounts:
-            # docker-registry 시크릿을 config.json 파일로 정확히 마운트
             - name: docker-config
               mountPath: /kaniko/.docker/config.json
               subPath: .dockerconfigjson
