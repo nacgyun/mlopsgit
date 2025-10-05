@@ -8,27 +8,37 @@ spec:
   template:
     metadata:
       labels:
-        allow-egress-internet: "true"   # ← egress 허용 라벨
+        allow-egress-internet: "true"
     spec:
       restartPolicy: Never
+
+      # GHCR push 인증용 docker-config (이미 있음)
       volumes:
         - name: docker-config
           secret:
             secretName: docker-config
+
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:v1.23.0
           args:
+            # GitHub repo 특정 커밋을 컨텍스트로
             - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
             - --dockerfile=Dockerfile.runtime
+
+            # ⬇️ 배포 기준 태그 (커밋 SHA) — train-job과 1:1 매칭
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
+
+            # ⬇️ (선택) 보조 태그들 — 원하면 유지
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
             - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
+
             - --cache=true
             - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
             - --verbosity=info
           env:
             - name: GODEBUG
-              value: "ipv6=0"               # ← IPv6 강제 비활성화 (Go 런타임)
+              value: "ipv6=0"
             - name: DOCKER_CONFIG
               value: /kaniko/.docker
           volumeMounts:
