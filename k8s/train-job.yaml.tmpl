@@ -18,7 +18,7 @@ spec:
           - name: attempts
             value: "2"
 
-      # GHCR가 private → pull 인증 시크릿 연결
+      # GHCR가 private → pull용 시크릿 지정 (read:packages)
       imagePullSecrets:
         - name: ghcr-pull
 
@@ -27,35 +27,36 @@ spec:
           image: alpine/git:2.45.2
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh","-lc"]
-          args: |
-            set -euo pipefail
-            echo "[fetch-src] start"
-            GIT_URL="${GITHUB_TOKEN:+https://oauth2:${GITHUB_TOKEN}@github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
-            GIT_URL="${GIT_URL:-https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
-            SHA="__GIT_SHA__"
+          args:
+            - |
+              set -euo pipefail
+              echo "[fetch-src] start"
+              GIT_URL="${GITHUB_TOKEN:+https://oauth2:${GITHUB_TOKEN}@github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
+              GIT_URL="${GIT_URL:-https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
+              SHA="__GIT_SHA__"
 
-            git config --global http.lowSpeedLimit 1000
-            git config --global http.lowSpeedTime 20
-            git config --global core.longpaths true
+              git config --global http.lowSpeedLimit 1000
+              git config --global http.lowSpeedTime 20
+              git config --global core.longpaths true
 
-            mkdir -p /workspace && cd /workspace
-            git init
-            git remote add origin "$GIT_URL"
+              mkdir -p /workspace && cd /workspace
+              git init
+              git remote add origin "$GIT_URL"
 
-            for i in 1 2 3; do
-              git fetch --filter=blob:none --no-tags origin \
-                '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' && break
-              echo "[fetch-src] refs fetch retry $i"; sleep 3
-            done
+              for i in 1 2 3; do
+                git fetch --filter=blob:none --no-tags origin \
+                  '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' && break
+                echo "[fetch-src] refs fetch retry $i"; sleep 3
+              done
 
-            for i in 1 2 3; do
-              git fetch origin "$SHA" && break
-              echo "[fetch-src] sha fetch retry $i"; sleep 3
-            done
+              for i in 1 2 3; do
+                git fetch origin "$SHA" && break
+                echo "[fetch-src] sha fetch retry $i"; sleep 3
+              done
 
-            git checkout --detach "$SHA"
-            echo "[fetch-src] checked out $SHA"
-            ls -al
+              git checkout --detach "$SHA"
+              echo "[fetch-src] checked out $SHA"
+              ls -al
           env:
             - name: GITHUB_TOKEN
               valueFrom:
@@ -68,15 +69,15 @@ spec:
 
       containers:
         - name: trainer
-          # Kaniko가 방금 푸시한 커밋 SHA 태그만 사용
           image: ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
           imagePullPolicy: IfNotPresent
           workingDir: /opt/app
           command: ["/bin/sh","-lc"]
-          args: |
-            set -eux
-            echo "[trainer] using SHA: ${GIT_SHA}"
-            python ml/train.py
+          args:
+            - |
+              set -eux
+              echo "[trainer] using SHA: ${GIT_SHA}"
+              python ml/train.py
           env:
             - name: GIT_SHA
               value: "__GIT_SHA__"
