@@ -110,7 +110,6 @@ jobs:
               -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
-          # 렌더 가드
           if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY)__' /tmp/kaniko-job.yaml; then
             echo "❌ placeholder left in kaniko-job.yaml"; sed -n '1,180p' /tmp/kaniko-job.yaml; exit 1
           fi
@@ -143,7 +142,6 @@ jobs:
               -e "s|__GITHUB_REPO__|${GITHUB_REPO}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
 
-          # 렌더 가드
           if grep -Eq '__(NAMESPACE|IMAGE|GIT_SHA|GITHUB_OWNER|GITHUB_REPO)__' /tmp/train-job.yaml; then
             echo "❌ placeholder left in train-job.yaml"; sed -n '1,200p' /tmp/train-job.yaml; exit 1
           fi

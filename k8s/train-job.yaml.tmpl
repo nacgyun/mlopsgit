@@ -69,14 +69,16 @@ spec:
 
       containers:
         - name: trainer
-          image: ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
+          # ✅ 워크플로가 최종적으로 주입한 태그 사용 (runtime-<build_key> or runtime-<sha> or runtime)
+          image: __IMAGE__
           imagePullPolicy: IfNotPresent
           workingDir: /opt/app
           command: ["/bin/sh","-lc"]
           args:
             - |
               set -eux
-              echo "[trainer] using SHA: ${GIT_SHA}"
+              echo "[trainer] using image: __IMAGE__"
+              echo "[trainer] using code SHA: ${GIT_SHA}"
               python ml/train.py
           env:
             - name: GIT_SHA
