@@ -11,7 +11,7 @@ jobs:
 
     env:
       NAMESPACE: mlops
-      TRAIN_JOB_NAME: train-job
+      JOB_BASENAME: train-job
       IMAGE_RUNTIME: ghcr.io/nacgyun/mlopsgit:runtime
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
@@ -30,12 +30,19 @@ jobs:
           fi
           kubectl version --client=true
 
-      - name: Get vars
+      - name: Compute vars
         id: vars
         run: |
-          set -e
+          set -euo pipefail
           echo "GIT_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
           echo "SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-12)" >> $GITHUB_ENV
+          echo "RUN_ID=${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          echo "BUILD_ID=${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
+          # lowercase safe forms
+          echo "OWNER_LC=$(echo "${GITHUB_OWNER:-$GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "REPO_LC=$(echo "${GITHUB_REPO:-${GITHUB_REPOSITORY#*/}}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "NS_LC=$(echo "${NAMESPACE}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "JOB_NAME=$(echo "${JOB_BASENAME}-${GITHUB_RUN_ID}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       - name: Detect changes for runtime image (ref only)
         id: changes
@@ -51,7 +58,7 @@ jobs:
       - name: Check runtime tag by BUILD_KEY
         id: tagcheck
         env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 이상 권장
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 권장
           GITHUB_TOKEN: ${{ github.token }}      # fallback
         run: |
           set -euo pipefail
@@ -64,7 +71,6 @@ jobs:
           REPO="${GITHUB_REPO:-mlopsgit}"
           TOKEN="${GHCR_PAT:-$GITHUB_TOKEN}"
 
-          # BUILD_KEY: Dockerfile.runtime + ml/requirements.txt 해시
           if [ -f Dockerfile.runtime ] && [ -f ml/requirements.txt ]; then
             BUILD_KEY="$( (cat Dockerfile.runtime; echo; cat ml/requirements.txt) | sha256sum | awk '{print $1}')"
           elif [ -f Dockerfile.runtime ]; then
@@ -82,16 +88,12 @@ jobs:
 
           NEED_BUILD=false
           if [ -z "${BUILD_KEY}" ]; then
-            echo "BUILD_KEY empty → build required"
             NEED_BUILD=true
           elif has_build_tag; then
-            echo "Tag runtime-${BUILD_KEY} exists → skip build"
             NEED_BUILD=false
           else
-            echo "No tag runtime-${BUILD_KEY} → build required"
             NEED_BUILD=true
           fi
-
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
       - name: Kaniko runtime-build (render → apply)
@@ -100,12 +102,12 @@ jobs:
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
           set -euxo pipefail
-          : "${KANIKO_JOB_NAME:?}"; : "${IMAGE_RUNTIME:?}"; : "${GIT_SHA:?}"; : "${NAMESPACE:?}"
+          : "${KANIKO_JOB_NAME:?}"; : "${IMAGE_RUNTIME:?}"; : "${GIT_SHA:?}"; : "${NS_LC:?}"
 
           sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
-              -e "s|__NAMESPACE__|${NAMESPACE}|g" \
-              -e "s|__GITHUB_OWNER__|${GITHUB_OWNER}|g" \
-              -e "s|__GITHUB_REPO__|${GITHUB_REPO}|g" \
+              -e "s|__NAMESPACE__|${NS_LC}|g" \
+              -e "s|__GITHUB_OWNER__|${OWNER_LC}|g" \
+              -e "s|__GITHUB_REPO__|${REPO_LC}|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
               -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
@@ -114,15 +116,15 @@ jobs:
             echo "❌ placeholder left in kaniko-job.yaml"; sed -n '1,180p' /tmp/kaniko-job.yaml; exit 1
           fi
 
-          kubectl -n "${NAMESPACE}" create --dry-run=client -f /tmp/kaniko-job.yaml -o yaml >/dev/null
+          kubectl -n "${NS_LC}" create --dry-run=client -f /tmp/kaniko-job.yaml -o yaml >/dev/null
           echo "----- rendered kaniko-job -----"; sed -n '1,200p' /tmp/kaniko-job.yaml
 
-          kubectl -n "${NAMESPACE}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found || true
-          kubectl -n "${NAMESPACE}" apply -f /tmp/kaniko-job.yaml
-          kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=30m "job/${KANIKO_JOB_NAME}"
+          kubectl -n "${NS_LC}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found || true
+          kubectl -n "${NS_LC}" apply -f /tmp/kaniko-job.yaml
+          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=30m "job/${KANIKO_JOB_NAME}"
 
-          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" logs "$POD" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
+          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n "${NS_LC}" logs "$POD" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
       - name: Compute IMAGE tag (prefer BUILD_KEY; fallback SHA)
         run: |
@@ -134,31 +136,56 @@ jobs:
 
       - name: Render Train Job manifest
         run: |
-          set -e
-          sed -e "s|__IMAGE__|${IMAGE_RUNTIME_SHA}|g" \
+          set -euo pipefail
+          sed -e "s|__JOB_NAME__|${JOB_NAME}|g" \
+              -e "s|__NAMESPACE__|${NS_LC}|g" \
+              -e "s|__RUN_ID__|${RUN_ID}|g" \
+              -e "s|__BUILD_ID__|${BUILD_ID}|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
-              -e "s|__NAMESPACE__|${NAMESPACE}|g" \
-              -e "s|__GITHUB_OWNER__|${GITHUB_OWNER}|g" \
-              -e "s|__GITHUB_REPO__|${GITHUB_REPO}|g" \
+              -e "s|__IMAGE__|${IMAGE_RUNTIME_SHA}|g" \
+              -e "s|__GITHUB_OWNER__|${OWNER_LC}|g" \
+              -e "s|__GITHUB_REPO__|${REPO_LC}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
 
-          if grep -Eq '__(NAMESPACE|IMAGE|GIT_SHA|GITHUB_OWNER|GITHUB_REPO)__' /tmp/train-job.yaml; then
-            echo "❌ placeholder left in train-job.yaml"; sed -n '1,200p' /tmp/train-job.yaml; exit 1
+          # 치환 누락 검증 (남아있으면 실패)
+          if grep -qE "__[A-Z0-9_]+__" /tmp/train-job.yaml; then
+            echo "❌ placeholder left in train-job.yaml"
+            grep -nE "__[A-Z0-9_]+__" /tmp/train-job.yaml || true
+            exit 1
           fi
 
-          echo "----- rendered train-job -----"; sed -n '1,220p' /tmp/train-job.yaml
+          # RFC1123 이름 검증
+          echo "${JOB_NAME}" | grep -qE '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || { echo "❌ invalid JOB_NAME=${JOB_NAME}"; exit 1; }
+
+          echo "----- rendered train-job -----"; sed -n '1,240p' /tmp/train-job.yaml
 
       - name: Apply Train Job
         run: |
-          set -e
-          kubectl -n "${NAMESPACE}" delete job "${TRAIN_JOB_NAME}" --ignore-not-found || true
-          kubectl -n "${NAMESPACE}" apply -f /tmp/train-job.yaml
-          kubectl -n "${NAMESPACE}" get pods -l job-name="${TRAIN_JOB_NAME}" -o wide || true
+          set -euo pipefail
+          kubectl -n "${NS_LC}" delete job "${JOB_NAME}" --ignore-not-found --wait=true || true
+          kubectl -n "${NS_LC}" apply -f /tmp/train-job.yaml
+          kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
 
       - name: Wait Train → logs
         run: |
-          set -e
-          kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=60m job/${TRAIN_JOB_NAME}
-          POD=$(kubectl -n "${NAMESPACE}" get pod -l job-name="${TRAIN_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NAMESPACE}" logs "$POD" --tail=300 || true
+          set -euo pipefail
+          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=60m job/${JOB_NAME}
+          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          # 실시간 로그가 보이도록 템플릿에서 python -u / PYTHONUNBUFFERED=1 적용되어 있어야 함
+          kubectl -n "${NS_LC}" logs "$POD" -c trainer --tail=300 || true
+          kubectl -n "${NS_LC}" logs "$POD" -c fetch-src --tail=100 || true
+
+      - name: On failure dump diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          echo "---- describe job ----"
+          kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
+          echo "---- describe pod ----"
+          kubectl -n "${NS_LC}" describe pod "${POD}" || true
+          echo "---- init logs ----"
+          kubectl -n "${NS_LC}" logs "${POD}" -c fetch-src --tail=200 || true
+          echo "---- trainer logs ----"
+          kubectl -n "${NS_LC}" logs "${POD}" -c trainer --tail=500 || true
 
