@@ -1,11 +1,24 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: train-job
+  name: __JOB_NAME__          # e.g. train-job-<run_id>
   namespace: __NAMESPACE__
+  labels:
+    app: train
+    run-id: "__RUN_ID__"      # ${{ github.run_id }}
+    sha: "__GIT_SHA__"        # ${{ github.sha }}
+    build-id: "__BUILD_ID__"  # ${{ github.run_number }}-${{ github.run_attempt }}
 spec:
   backoffLimit: 0
+  # (선택) 전체 타임아웃: 필요 시 조정 (초 단위, 예: 2시간)
+  activeDeadlineSeconds: 7200
   template:
+    metadata:
+      labels:
+        app: train
+        run-id: "__RUN_ID__"
+        sha: "__GIT_SHA__"
+        build-id: "__BUILD_ID__"
     spec:
       restartPolicy: Never
 
@@ -18,7 +31,7 @@ spec:
           - name: attempts
             value: "2"
 
-      # GHCR가 private → pull용 시크릿 지정 (read:packages)
+      # GHCR private pull
       imagePullSecrets:
         - name: ghcr-pull
 
@@ -69,20 +82,18 @@ spec:
 
       containers:
         - name: trainer
-          # ✅ 워크플로가 최종적으로 주입한 태그 사용 (runtime-<build_key> or runtime-<sha> or runtime)
-          image: __IMAGE__
+          image: __IMAGE__                 # e.g. ghcr.io/<owner>/<repo>:runtime-<sha>
           imagePullPolicy: IfNotPresent
           workingDir: /opt/app
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eux
-              echo "[trainer] using image: __IMAGE__"
-              echo "[trainer] using code SHA: ${GIT_SHA}"
-              python ml/train.py
           env:
+            - name: PYTHONUNBUFFERED       # 실시간 로깅
+              value: "1"
             - name: GIT_SHA
               value: "__GIT_SHA__"
+            - name: RUN_ID
+              value: "__RUN_ID__"
+            - name: BUILD_ID
+              value: "__BUILD_ID__"
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.mlops.svc.cluster.local:5000"
             - name: MLFLOW_EXPERIMENT_NAME
@@ -98,6 +109,14 @@ spec:
           envFrom:
             - secretRef:
                 name: s3-mlflow-creds
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eux
+              echo "[trainer] using image: __IMAGE__"
+              echo "[trainer] using code SHA: ${GIT_SHA}"
+              # -u로 stdout/stderr 즉시 flush
+              python -u ml/train.py
           volumeMounts:
             - name: workspace
               mountPath: /opt/app
