@@ -15,7 +15,6 @@ spec:
         app: gh-runner
     spec:
       serviceAccountName: gh-runner-sa
-      # GHCR 프라이빗 이미지가 필요하면 비밀키를 붙이세요(없으면 삭제해도 됨)
       imagePullSecrets:
       - name: ghcr-pull
       containers:
