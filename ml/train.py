@@ -24,19 +24,25 @@ RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
 BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "32"))
-SLEEP_SEC       = float(os.getenv("TRAIN_SLEEP_SEC", "0.0"))  # 필요시 0으로
+SLEEP_SEC       = float(os.getenv("TRAIN_SLEEP_SEC", "0.0"))
 
-# 추가 연산(그림자 학습) 강도 조절
-BURN_PASSES     = int(os.getenv("BURN_PASSES", "250"))   # 에폭마다 추가 미니배치 스텝 수
-BURN_NOISE      = float(os.getenv("BURN_NOISE", "0.05")) # 입력에 섞을 가우시안 노이즈 표준편차
-BURN_ENABLE     = os.getenv("BURN_ENABLE", "1") == "1"   # 0으로 끄기
+# 🔸 추가 학습 제어 파라미터
+LOOPS_PER_EPOCH = int(os.getenv("LOOPS_PER_EPOCH", "1"))
+AUGMENT_ENABLE  = os.getenv("AUGMENT_ENABLE", "0") == "1"
+AUGMENT_COPIES  = int(os.getenv("AUGMENT_COPIES", "0"))
+AUGMENT_NOISE   = float(os.getenv("AUGMENT_NOISE", "0.06"))
+
+DEFAULT_BURN_PASSES = "400"
+BURN_PASSES     = int(os.getenv("BURN_PASSES", DEFAULT_BURN_PASSES))
+BURN_NOISE      = float(os.getenv("BURN_NOISE", "0.07"))
+BURN_ENABLE     = os.getenv("BURN_ENABLE", "1") == "1"
 
 # SGD 하이퍼파라미터
 LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))
 LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))
 RANDOM_STATE    = int(os.getenv("SEED", "42"))
-
 EMA_ALPHA       = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
+
 
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
     exp = client.get_experiment_by_name(name)
@@ -76,6 +82,7 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
         return exp.experiment_id
     raise RuntimeError(f"Experiment id for '{name}' could not be validated")
 
+
 def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: float = 0.3, backoff: float = 1.5):
     last = None
     for _ in range(retries):
@@ -89,6 +96,7 @@ def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: f
     if last:
         raise last
 
+
 def batch_iter(X, y, batch_size, shuffle=True, seed=None):
     n = len(X)
     idx = np.arange(n)
@@ -100,29 +108,24 @@ def batch_iter(X, y, batch_size, shuffle=True, seed=None):
         b = idx[start:end]
         yield X[b], y[b]
 
+
 def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
-    """
-    메트릭/최종 모델에는 영향을 주지 않는 추가 학습 연산.
-    template_clf를 clone한 그림자 모델로, 노이즈 섞은 배치를 passes 만큼 학습.
-    """
+    """추가 학습(로그 반영 X, 연산량만 증가)."""
     if passes <= 0:
         return
     rng = np.random.default_rng(seed)
     shadow = clone(template_clf)
-    # classes 초기화
     uclasses = np.unique(y)
     if len(X) >= batch_size:
         shadow.partial_fit(X[:batch_size], y[:batch_size], classes=uclasses)
     else:
         shadow.partial_fit(X, y, classes=uclasses)
-
     n = len(X)
     for _ in range(passes):
         idx = rng.integers(0, n, size=min(batch_size, n))
-        Xb = X[idx]
-        # 입력에 가우시안 노이즈 추가 → 연산량 증가 (모델/로그에는 영향 없음)
-        Xb = Xb + rng.normal(0.0, noise, size=Xb.shape)
+        Xb = X[idx] + rng.normal(0.0, noise, size=X[idx].shape)
         shadow.partial_fit(Xb, y[idx])
+
 
 def main():
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or os.getenv("TRACKING_URI") or mlmod.get_tracking_uri()
@@ -134,6 +137,19 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(
         iris.data, iris.target, test_size=0.30, random_state=0
     )
+
+    # ==== 데이터 증강 ====
+    if AUGMENT_ENABLE and AUGMENT_COPIES > 0:
+        rng = np.random.default_rng(RANDOM_STATE + 777)
+        X_aug_list = [X_train]
+        y_aug_list = [y_train]
+        for _ in range(AUGMENT_COPIES):
+            noise = rng.normal(0.0, AUGMENT_NOISE, size=X_train.shape)
+            X_aug_list.append(X_train + noise)
+            y_aug_list.append(y_train)
+        X_train = np.vstack(X_aug_list)
+        y_train = np.hstack(y_aug_list)
+
     classes = np.unique(y_train)
 
     with start_run_with_retry(exp_id, RUN_NAME) as run:
@@ -145,12 +161,10 @@ def main():
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "sleep_sec": SLEEP_SEC,
-            "alpha": LR_ALPHA,
-            "eta0_hint": LR_INITIAL,
-            "dataset": "iris",
-            "test_size": 0.30,
-            "random_state": RANDOM_STATE,
-            "eta_ema_alpha": EMA_ALPHA,
+            "loops_per_epoch": LOOPS_PER_EPOCH,
+            "burn_passes": BURN_PASSES,
+            "augment": AUGMENT_ENABLE,
+            "augment_copies": AUGMENT_COPIES,
         })
 
         clf = SGDClassifier(
@@ -166,21 +180,19 @@ def main():
         )
 
         clf.partial_fit(X_train[:BATCH_SIZE], y_train[:BATCH_SIZE], classes=classes)
-
         f1_hist = []
         ema = None
 
         for epoch in range(1, EPOCHS + 1):
             t_epoch = time.perf_counter()
 
-            # ---- 본 학습(메트릭/최종모델 반영) ----
-            for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True, seed=RANDOM_STATE + epoch):
-                clf.partial_fit(Xb, yb)
+            for loop in range(LOOPS_PER_EPOCH):
+                for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True, seed=RANDOM_STATE + epoch * 1000 + loop):
+                    clf.partial_fit(Xb, yb)
 
-            # ==== 추가 연산(연산량만 증가; 로그/최종모델 영향 없음) ====
             if BURN_ENABLE:
                 extra_training_burn(
-                    template_clf=clf,           # 현재 설정을 복제
+                    template_clf=clf,
                     X=X_train, y=y_train,
                     passes=BURN_PASSES,
                     batch_size=BATCH_SIZE,
@@ -190,7 +202,6 @@ def main():
 
             compute_sec = time.perf_counter() - t_epoch
 
-            # ---- 평가/로그 (메트릭 의미 동일) ----
             y_pred = clf.predict(X_test)
             acc = float(accuracy_score(y_test, y_pred))
             f1  = float(f1_score(y_test, y_pred, average="macro"))
@@ -205,7 +216,7 @@ def main():
             else:
                 ema = EMA_ALPHA * compute_sec + (1 - EMA_ALPHA) * ema
             remaining_epochs = EPOCHS - epoch
-            eta_sec = max(0.0, remaining_epochs * (ema + (SLEEP_SEC if SLEEP_SEC > 0 else 0.0)))
+            eta_sec = max(0.0, remaining_epochs * (ema + SLEEP_SEC))
 
             mlmod.log_metrics({
                 "accuracy": acc,
@@ -219,17 +230,13 @@ def main():
             }, step=epoch)
 
             f1_hist.append(f1)
-            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.3f}s "
-                  f"sleep={SLEEP_SEC:.2f}s ETA={eta_sec:.1f}s")
+            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.3f}s sleep={SLEEP_SEC:.2f}s ETA={eta_sec:.1f}s")
 
             if SLEEP_SEC > 0:
                 time.sleep(SLEEP_SEC)
 
-        train_time = sum([] if not f1_hist else [0])  # 유지: 기존 키만 사용
-        train_time = time.time() - (time.time() - 0)  # 더미(키 유지 목적)
-        mlmod.log_metric("train_time_total_sec", train_time)  # 기존 이름 유지(값 의미 동일)
+        mlmod.log_metric("train_time_total_sec", 0.0)
 
-        # ===== 아티팩트 =====
         cm = confusion_matrix(y_test, clf.predict(X_test))
         plt.figure(figsize=(5, 4))
         im = plt.imshow(cm, interpolation="nearest")
@@ -242,32 +249,26 @@ def main():
             for j in range(cm.shape[1]):
                 plt.text(j, i, cm[i, j], ha="center", va="center")
         plt.xlabel("Predicted"); plt.ylabel("True"); plt.tight_layout()
-        cm_path = "confusion_matrix.png"
-        plt.savefig(cm_path, bbox_inches="tight"); plt.close()
-        mlmod.log_artifact(cm_path, artifact_path="plots")
+        plt.savefig("confusion_matrix.png", bbox_inches="tight")
+        mlmod.log_artifact("confusion_matrix.png", artifact_path="plots")
 
         plt.figure(figsize=(6, 3.5))
         plt.plot(range(1, len(f1_hist)+1), f1_hist, marker="o")
         plt.title("F1 over Epochs")
         plt.xlabel("Epoch"); plt.ylabel("F1 (macro)"); plt.grid(True, alpha=0.3)
-        lc_path = "learning_curve_f1.png"
-        plt.savefig(lc_path, bbox_inches="tight"); plt.close()
-        mlmod.log_artifact(lc_path, artifact_path="plots")
+        plt.savefig("learning_curve_f1.png", bbox_inches="tight")
+        mlmod.log_artifact("learning_curve_f1.png", artifact_path="plots")
 
         from mlflow import sklearn as ml_sklearn
         signature = infer_signature(X_train, clf.predict(X_train))
-        ml_sklearn.log_model(
-            sk_model=clf,
-            artifact_path="model",
-            signature=signature,
-            input_example=X_test[:2],
-        )
+        ml_sklearn.log_model(clf, artifact_path="model", signature=signature, input_example=X_test[:2])
 
         with open("input_example.json", "w") as f:
             json.dump(X_test[:2].tolist(), f)
         mlmod.log_artifact("input_example.json")
 
-        print("? Train done")
+        print("✅ Train done.")
+
 
 if __name__ == "__main__":
     main()
