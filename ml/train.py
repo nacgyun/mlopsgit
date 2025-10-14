@@ -22,20 +22,27 @@ from sklearn.linear_model import SGDClassifier
 EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
+# 기본 러닝타임 타깃(초) — 대략 5분
+TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "300"))
+
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
-BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "32"))
+BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "64"))     # 기본 64로 약간 키움
 SLEEP_SEC       = float(os.getenv("TRAIN_SLEEP_SEC", "0.0"))
 
-# 🔸 추가 학습 제어 파라미터
-LOOPS_PER_EPOCH = int(os.getenv("LOOPS_PER_EPOCH", "1"))
-AUGMENT_ENABLE  = os.getenv("AUGMENT_ENABLE", "0") == "1"
-AUGMENT_COPIES  = int(os.getenv("AUGMENT_COPIES", "0"))
-AUGMENT_NOISE   = float(os.getenv("AUGMENT_NOISE", "0.06"))
+# 🔸 학습 연산량 제어 파라미터 (기본으로 꽤 크게 설정)
+LOOPS_PER_EPOCH = int(os.getenv("LOOPS_PER_EPOCH", "3"))       # 에폭당 데이터 3회 반복
+AUGMENT_ENABLE  = os.getenv("AUGMENT_ENABLE", "1") == "1"      # 기본 켬
+AUGMENT_COPIES  = int(os.getenv("AUGMENT_COPIES", "3"))        # 학습셋 4배(원본+3)
+AUGMENT_NOISE   = float(os.getenv("AUGMENT_NOISE", "0.08"))
 
-DEFAULT_BURN_PASSES = "400"
+# 🔸 burn(추가 연산) 기본값 상향
+DEFAULT_BURN_PASSES = "1200"
 BURN_PASSES     = int(os.getenv("BURN_PASSES", DEFAULT_BURN_PASSES))
-BURN_NOISE      = float(os.getenv("BURN_NOISE", "0.07"))
+BURN_NOISE      = float(os.getenv("BURN_NOISE", "0.08"))
 BURN_ENABLE     = os.getenv("BURN_ENABLE", "1") == "1"
+
+# 🔸 타임 타깃을 맞추기 위한 추가 burn 청크 크기
+BURN_CHUNK_PASSES = int(os.getenv("BURN_CHUNK_PASSES", "256"))
 
 # SGD 하이퍼파라미터
 LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))
@@ -127,7 +134,31 @@ def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
         shadow.partial_fit(Xb, y[idx])
 
 
+def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_deadline_sec):
+    """
+    목표 벽시계 시간에 맞추기 위해 작은 burn 청크를 반복.
+    - 각 청크는 BURN_CHUNK_PASSES 만큼 shadow 학습
+    - 남은 시간이 충분하면 계속 수행
+    """
+    if not BURN_ENABLE:
+        return
+    start = time.perf_counter()
+    rng_seed = seed
+    while time.perf_counter() - start < target_deadline_sec:
+        extra_training_burn(
+            template_clf=template_clf,
+            X=X, y=y,
+            passes=BURN_CHUNK_PASSES,
+            batch_size=batch_size,
+            noise=noise,
+            seed=rng_seed
+        )
+        rng_seed += 1  # 시드 변경으로 배치 다양화
+
+
 def main():
+    wall_start = time.perf_counter()
+
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or os.getenv("TRACKING_URI") or mlmod.get_tracking_uri()
     mlmod.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
@@ -138,7 +169,7 @@ def main():
         iris.data, iris.target, test_size=0.30, random_state=0
     )
 
-    # ==== 데이터 증강 ====
+    # ==== 데이터 증강 (기본 켜짐) ====
     if AUGMENT_ENABLE and AUGMENT_COPIES > 0:
         rng = np.random.default_rng(RANDOM_STATE + 777)
         X_aug_list = [X_train]
@@ -165,6 +196,9 @@ def main():
             "burn_passes": BURN_PASSES,
             "augment": AUGMENT_ENABLE,
             "augment_copies": AUGMENT_COPIES,
+            "augment_noise": AUGMENT_NOISE,
+            "target_wall_sec": TARGET_WALL_SEC,
+            "burn_chunk_passes": BURN_CHUNK_PASSES
         })
 
         clf = SGDClassifier(
@@ -179,18 +213,25 @@ def main():
             tol=None
         )
 
+        # 초기 partial_fit (classes 세팅)
         clf.partial_fit(X_train[:BATCH_SIZE], y_train[:BATCH_SIZE], classes=classes)
+
         f1_hist = []
         ema = None
 
         for epoch in range(1, EPOCHS + 1):
             t_epoch = time.perf_counter()
 
+            # 본 학습: 데이터 LOOPS_PER_EPOCH 만큼 반복 학습
             for loop in range(LOOPS_PER_EPOCH):
-                for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True, seed=RANDOM_STATE + epoch * 1000 + loop):
+                for Xb, yb in batch_iter(
+                    X_train, y_train, BATCH_SIZE, shuffle=True,
+                    seed=RANDOM_STATE + epoch * 1000 + loop
+                ):
                     clf.partial_fit(Xb, yb)
 
-            if BURN_ENABLE:
+            # 고정 burn (상향된 기본값)
+            if BURN_ENABLE and BURN_PASSES > 0:
                 extra_training_burn(
                     template_clf=clf,
                     X=X_train, y=y_train,
@@ -202,6 +243,7 @@ def main():
 
             compute_sec = time.perf_counter() - t_epoch
 
+            # 평가/로그
             y_pred = clf.predict(X_test)
             acc = float(accuracy_score(y_test, y_pred))
             f1  = float(f1_score(y_test, y_pred, average="macro"))
@@ -215,8 +257,12 @@ def main():
                 ema = compute_sec
             else:
                 ema = EMA_ALPHA * compute_sec + (1 - EMA_ALPHA) * ema
+
+            elapsed = time.perf_counter() - wall_start
             remaining_epochs = EPOCHS - epoch
-            eta_sec = max(0.0, remaining_epochs * (ema + SLEEP_SEC))
+
+            # 남은 시간을 대략 맞추기 위한 ETA (로그용)
+            eta_sec = max(0.0, TARGET_WALL_SEC - elapsed)
 
             mlmod.log_metrics({
                 "accuracy": acc,
@@ -226,17 +272,44 @@ def main():
                 "epoch_sleep_sec": SLEEP_SEC,
                 "epoch_time_sec": compute_sec + SLEEP_SEC,
                 "eta_sec": eta_sec,
-                "progress_pct": 100.0 * epoch / EPOCHS,
+                "progress_pct": min(99.9, 100.0 * epoch / EPOCHS),
+                "elapsed_sec": elapsed
             }, step=epoch)
 
             f1_hist.append(f1)
-            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.3f}s sleep={SLEEP_SEC:.2f}s ETA={eta_sec:.1f}s")
+            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
+                  f"sleep={SLEEP_SEC:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
 
             if SLEEP_SEC > 0:
                 time.sleep(SLEEP_SEC)
 
-        mlmod.log_metric("train_time_total_sec", 0.0)
+            # ---- 타임 타깃 보정: 에폭 끝마다 남은 시간에 맞춰 burn 청크 반복 ----
+            #   목표 시간까지 남은 시간이 크면 추가 burn 수행(최대 60초/에폭)
+            #   CI 환경에서 과도하게 늘어지지 않도록 per-epoch cap을 둔다.
+            remaining_to_target = TARGET_WALL_SEC - (time.perf_counter() - wall_start)
+            if BURN_ENABLE and remaining_to_target > 5.0:  # 5초 이상 남으면 보정
+                per_epoch_cap = float(os.getenv("PER_EPOCH_SPEND_CAP_SEC", "60"))
+                to_spend = min(per_epoch_cap, max(0.0, remaining_to_target * 0.4))
+                # 40%만 메우고 남은 건 다음 에폭에 보정 (오버슈트 방지)
+                if to_spend > 1.0:
+                    spend_time_to_target(
+                        template_clf=clf,
+                        X=X_train, y=y_train,
+                        batch_size=BATCH_SIZE,
+                        noise=BURN_NOISE,
+                        seed=RANDOM_STATE + 2000 + epoch,
+                        target_deadline_sec=to_spend
+                    )
 
+            # 목표 시간을 충분히 넘겼다면 조기 종료
+            if time.perf_counter() - wall_start >= TARGET_WALL_SEC:
+                print(f"[info] target wall time ({TARGET_WALL_SEC:.0f}s) reached. stopping early.")
+                break
+
+        # 총 학습 시간(더미 키 유지용)
+        mlmod.log_metric("train_time_total_sec", time.perf_counter() - wall_start)
+
+        # ===== 아티팩트 =====
         cm = confusion_matrix(y_test, clf.predict(X_test))
         plt.figure(figsize=(5, 4))
         im = plt.imshow(cm, interpolation="nearest")
@@ -261,7 +334,12 @@ def main():
 
         from mlflow import sklearn as ml_sklearn
         signature = infer_signature(X_train, clf.predict(X_train))
-        ml_sklearn.log_model(clf, artifact_path="model", signature=signature, input_example=X_test[:2])
+        ml_sklearn.log_model(
+            sk_model=clf,
+            artifact_path="model",
+            signature=signature,
+            input_example=X_test[:2]
+        )
 
         with open("input_example.json", "w") as f:
             json.dump(X_test[:2].tolist(), f)
