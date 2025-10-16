@@ -26,22 +26,20 @@ RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "300"))
 
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
-BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "64"))     # 기본 64로 약간 키움
+BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "64"))
 SLEEP_SEC       = float(os.getenv("TRAIN_SLEEP_SEC", "0.0"))
 
-# 🔸 학습 연산량 제어 파라미터 (기본으로 꽤 크게 설정)
-LOOPS_PER_EPOCH = int(os.getenv("LOOPS_PER_EPOCH", "3"))       # 에폭당 데이터 3회 반복
-AUGMENT_ENABLE  = os.getenv("AUGMENT_ENABLE", "1") == "1"      # 기본 켬
-AUGMENT_COPIES  = int(os.getenv("AUGMENT_COPIES", "3"))        # 학습셋 4배(원본+3)
+# 🔸 학습 연산량 제어 파라미터
+LOOPS_PER_EPOCH = int(os.getenv("LOOPS_PER_EPOCH", "3"))
+AUGMENT_ENABLE  = os.getenv("AUGMENT_ENABLE", "1") == "1"
+AUGMENT_COPIES  = int(os.getenv("AUGMENT_COPIES", "3"))
 AUGMENT_NOISE   = float(os.getenv("AUGMENT_NOISE", "0.08"))
 
-# 🔸 burn(추가 연산) 기본값 상향
+# 🔸 burn(추가 연산)
 DEFAULT_BURN_PASSES = "1200"
 BURN_PASSES     = int(os.getenv("BURN_PASSES", DEFAULT_BURN_PASSES))
 BURN_NOISE      = float(os.getenv("BURN_NOISE", "0.08"))
 BURN_ENABLE     = os.getenv("BURN_ENABLE", "1") == "1"
-
-# 🔸 타임 타깃을 맞추기 위한 추가 burn 청크 크기
 BURN_CHUNK_PASSES = int(os.getenv("BURN_CHUNK_PASSES", "256"))
 
 # SGD 하이퍼파라미터
@@ -50,6 +48,18 @@ LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))
 RANDOM_STATE    = int(os.getenv("SEED", "42"))
 EMA_ALPHA       = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
 
+# 🔸 로그 설정: Promtail/Loki용 JSON 로그 출력 (기본 ON)
+LOG_JSON        = os.getenv("LOG_JSON", "1") == "1"
+
+def log_json_line(payload: dict):
+    """한 줄 JSON 로그 출력 (stdout). Promtail이 수집해 Loki로 보냄."""
+    if not LOG_JSON:
+        return
+    try:
+        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+    except Exception:
+        # JSON 직렬화 실패해도 학습은 계속
+        pass
 
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
     exp = client.get_experiment_by_name(name)
@@ -89,7 +99,6 @@ def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sle
         return exp.experiment_id
     raise RuntimeError(f"Experiment id for '{name}' could not be validated")
 
-
 def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: float = 0.3, backoff: float = 1.5):
     last = None
     for _ in range(retries):
@@ -103,7 +112,6 @@ def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: f
     if last:
         raise last
 
-
 def batch_iter(X, y, batch_size, shuffle=True, seed=None):
     n = len(X)
     idx = np.arange(n)
@@ -114,7 +122,6 @@ def batch_iter(X, y, batch_size, shuffle=True, seed=None):
         end = min(start + batch_size, n)
         b = idx[start:end]
         yield X[b], y[b]
-
 
 def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
     """추가 학습(로그 반영 X, 연산량만 증가)."""
@@ -133,13 +140,8 @@ def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
         Xb = X[idx] + rng.normal(0.0, noise, size=X[idx].shape)
         shadow.partial_fit(Xb, y[idx])
 
-
 def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_deadline_sec):
-    """
-    목표 벽시계 시간에 맞추기 위해 작은 burn 청크를 반복.
-    - 각 청크는 BURN_CHUNK_PASSES 만큼 shadow 학습
-    - 남은 시간이 충분하면 계속 수행
-    """
+    """목표 벽시계 시간에 맞추기 위한 burn 반복."""
     if not BURN_ENABLE:
         return
     start = time.perf_counter()
@@ -153,8 +155,7 @@ def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_dea
             noise=noise,
             seed=rng_seed
         )
-        rng_seed += 1  # 시드 변경으로 배치 다양화
-
+        rng_seed += 1
 
 def main():
     wall_start = time.perf_counter()
@@ -169,11 +170,10 @@ def main():
         iris.data, iris.target, test_size=0.30, random_state=0
     )
 
-    # ==== 데이터 증강 (기본 켜짐) ====
+    # ==== 데이터 증강 ====
     if AUGMENT_ENABLE and AUGMENT_COPIES > 0:
         rng = np.random.default_rng(RANDOM_STATE + 777)
-        X_aug_list = [X_train]
-        y_aug_list = [y_train]
+        X_aug_list = [X_train]; y_aug_list = [y_train]
         for _ in range(AUGMENT_COPIES):
             noise = rng.normal(0.0, AUGMENT_NOISE, size=X_train.shape)
             X_aug_list.append(X_train + noise)
@@ -222,7 +222,7 @@ def main():
         for epoch in range(1, EPOCHS + 1):
             t_epoch = time.perf_counter()
 
-            # 본 학습: 데이터 LOOPS_PER_EPOCH 만큼 반복 학습
+            # 본 학습
             for loop in range(LOOPS_PER_EPOCH):
                 for Xb, yb in batch_iter(
                     X_train, y_train, BATCH_SIZE, shuffle=True,
@@ -230,7 +230,7 @@ def main():
                 ):
                     clf.partial_fit(Xb, yb)
 
-            # 고정 burn (상향된 기본값)
+            # 고정 burn
             if BURN_ENABLE and BURN_PASSES > 0:
                 extra_training_burn(
                     template_clf=clf,
@@ -260,8 +260,6 @@ def main():
 
             elapsed = time.perf_counter() - wall_start
             remaining_epochs = EPOCHS - epoch
-
-            # 남은 시간을 대략 맞추기 위한 ETA (로그용)
             eta_sec = max(0.0, TARGET_WALL_SEC - elapsed)
 
             mlmod.log_metrics({
@@ -277,20 +275,28 @@ def main():
             }, step=epoch)
 
             f1_hist.append(f1)
+            # ── 사람이 읽는 로그
             print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
                   f"sleep={SLEEP_SEC:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
+            # ── Loki용 JSON 로그 (대시보드 패널이 이 값을 unwarp)
+            log_json_line({
+                "event":"epoch_metric",
+                "epoch": epoch,
+                "accuracy": acc,
+                # duration = 에폭 총 시간(학습+sleep). 패널은 이 키를 사용합니다.
+                "duration": round(compute_sec + SLEEP_SEC, 4),
+                "run_id": run_id,
+                "experiment": EXP_NAME,
+            })
 
             if SLEEP_SEC > 0:
                 time.sleep(SLEEP_SEC)
 
-            # ---- 타임 타깃 보정: 에폭 끝마다 남은 시간에 맞춰 burn 청크 반복 ----
-            #   목표 시간까지 남은 시간이 크면 추가 burn 수행(최대 60초/에폭)
-            #   CI 환경에서 과도하게 늘어지지 않도록 per-epoch cap을 둔다.
+            # 타임 타깃 보정
             remaining_to_target = TARGET_WALL_SEC - (time.perf_counter() - wall_start)
-            if BURN_ENABLE and remaining_to_target > 5.0:  # 5초 이상 남으면 보정
+            if BURN_ENABLE and remaining_to_target > 5.0:
                 per_epoch_cap = float(os.getenv("PER_EPOCH_SPEND_CAP_SEC", "60"))
                 to_spend = min(per_epoch_cap, max(0.0, remaining_to_target * 0.4))
-                # 40%만 메우고 남은 건 다음 에폭에 보정 (오버슈트 방지)
                 if to_spend > 1.0:
                     spend_time_to_target(
                         template_clf=clf,
@@ -301,13 +307,13 @@ def main():
                         target_deadline_sec=to_spend
                     )
 
-            # 목표 시간을 충분히 넘겼다면 조기 종료
             if time.perf_counter() - wall_start >= TARGET_WALL_SEC:
                 print(f"[info] target wall time ({TARGET_WALL_SEC:.0f}s) reached. stopping early.")
                 break
 
         # 총 학습 시간(더미 키 유지용)
-        mlmod.log_metric("train_time_total_sec", time.perf_counter() - wall_start)
+        total_time = time.perf_counter() - wall_start
+        mlmod.log_metric("train_time_total_sec", total_time)
 
         # ===== 아티팩트 =====
         cm = confusion_matrix(y_test, clf.predict(X_test))
@@ -338,16 +344,24 @@ def main():
             sk_model=clf,
             artifact_path="model",
             signature=signature,
-            input_example=X_test[:2]
+            input_example=X_train[:2]
         )
 
         with open("input_example.json", "w") as f:
             json.dump(X_test[:2].tolist(), f)
         mlmod.log_artifact("input_example.json")
 
-        print("✅ Train done.")
+        # ── 최종 JSON 한 줄 (마지막 포인트로 쓰기 좋음)
+        final_acc = float(f1_hist[-1]) if f1_hist else float("nan")
+        log_json_line({
+            "event":"train_done",
+            "accuracy": float(accuracy_score(y_test, clf.predict(X_test))),
+            "duration": round(total_time, 4),
+            "run_id": run_id,
+            "experiment": EXP_NAME,
+        })
 
+        print("✅ Train done.")
 
 if __name__ == "__main__":
     main()
-
