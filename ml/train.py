@@ -260,6 +260,7 @@ def main():
 
             elapsed = time.perf_counter() - wall_start
             remaining_epochs = EPOCHS - epoch
+            # 👉 남은 예상 시간(초) — 목표 벽시계 시간 기준
             eta_sec = max(0.0, TARGET_WALL_SEC - elapsed)
 
             mlmod.log_metrics({
@@ -269,7 +270,7 @@ def main():
                 "epoch_compute_sec": compute_sec,
                 "epoch_sleep_sec": SLEEP_SEC,
                 "epoch_time_sec": compute_sec + SLEEP_SEC,
-                "eta_sec": eta_sec,
+                "eta_sec": eta_sec,                 # MLflow에도 남김
                 "progress_pct": min(99.9, 100.0 * epoch / EPOCHS),
                 "elapsed_sec": elapsed
             }, step=epoch)
@@ -278,13 +279,13 @@ def main():
             # ── 사람이 읽는 로그
             print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
                   f"sleep={SLEEP_SEC:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
-            # ── Loki용 JSON 로그 (대시보드 패널이 이 값을 unwarp)
+            # ── Loki용 JSON 로그 (대시보드 패널이 이 값을 unwrap)
             log_json_line({
-                "event":"epoch_metric",
+                "event": "epoch_metric",
                 "epoch": epoch,
                 "accuracy": acc,
-                # duration = 에폭 총 시간(학습+sleep). 패널은 이 키를 사용합니다.
-                "duration": round(compute_sec + SLEEP_SEC, 4),
+                "duration": round(compute_sec + SLEEP_SEC, 4),  # 에폭 총 시간(참고)
+                "remaining_sec": round(eta_sec, 1),             # ✅ 남은 예상 시간(초)
                 "run_id": run_id,
                 "experiment": EXP_NAME,
             })
@@ -354,9 +355,10 @@ def main():
         # ── 최종 JSON 한 줄 (마지막 포인트로 쓰기 좋음)
         final_acc = float(f1_hist[-1]) if f1_hist else float("nan")
         log_json_line({
-            "event":"train_done",
+            "event": "train_done",
             "accuracy": float(accuracy_score(y_test, clf.predict(X_test))),
             "duration": round(total_time, 4),
+            "remaining_sec": 0.0,                 # ✅ 종료 시 0으로 고정
             "run_id": run_id,
             "experiment": EXP_NAME,
         })
@@ -365,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
