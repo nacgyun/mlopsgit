@@ -49,7 +49,7 @@ jobs:
           kubectl config use-context in-cluster
 
       - name: Promote in MLflow
-        run: python scripts/promote.py
+        run: python promote.py
 
       # === Serve 반영: 두 방식 중 택1 ===
       - name: Roll restart light-serve (K8s)
