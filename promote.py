@@ -16,7 +16,7 @@ def ensure_registered_model(name):
         client.create_registered_model(name)
 
 def find_or_create_version(name, run_id):
-    src = f"mlruns:/{run_id}/artifacts/model"   # 아티팩트 경로는 train 시 log_model(artifact_path='model') 기준
+    src = f"runs:/{run_id}/artifacts/model"   # 아티팩트 경로는 train 시 log_model(artifact_path='model') 기준
     for mv in client.search_model_versions(f"name='{name}'"):
         if mv.run_id == run_id:
             return mv
