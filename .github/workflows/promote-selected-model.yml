@@ -1,0 +1,57 @@
+name: Promote-Selected-Model
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: "MLflow model name (e.g., iris)"
+        required: true
+        default: "iris"
+      run_id:
+        description: "RUN_ID to promote (copy from MLflow UI)"
+        required: true
+      reload_method:
+        description: "How to refresh serve (rollout|http)"
+        required: true
+        default: "rollout"
+
+jobs:
+  promote:
+    runs-on: self-hosted   # 네 K8s 셀프호스티드 러너
+    env:
+      # 클러스터 내부 DNS 기준 MLflow URI/MinIO (네 환경에 맞춰 이미 구성됨)
+      MLFLOW_TRACKING_URI: http://mlflow.mlops.svc.cluster.local:5000
+      MODEL_NAME: ${{ inputs.model_name }}
+      RUN_ID: ${{ inputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install --no-cache-dir mlflow-skinny boto3
+
+      - name: Promote in MLflow
+        run: python scripts/promote.py
+
+      # === Serve 반영: 두 방식 중 택1 ===
+      - name: Roll restart light-serve (K8s)
+        if: ${{ inputs.reload_method == 'rollout' }}
+        run: |
+          # 배포 이름이 'light-serve'가 아닐 수도 있으니 우선 탐색
+          DEPLOY=$(kubectl -n mlops get deploy -o name | grep 'light-serve' || true)
+          if [ -z "$DEPLOY" ]; then
+            echo "Cannot find Deployment containing 'light-serve' in name"; exit 1
+          fi
+          kubectl -n mlops rollout restart "$DEPLOY"
+          kubectl -n mlops rollout status "$DEPLOY" --timeout=120s
+
+      - name: Call /reload on light-serve (HTTP)
+        if: ${{ inputs.reload_method == 'http' }}
+        run: |
+          # ClusterIP라면 클러스터 내부에서 curl 필요. 러너가 클러스터 내부면 아래 주소로 호출 가능
+          # Service FQDN 예시: http://light-serve.mlops.svc.cluster.local:8000/reload
+          curl -s -X POST http://light-serve.mlops.svc.cluster.local:8000/reload || true
+
