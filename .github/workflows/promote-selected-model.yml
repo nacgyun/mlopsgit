@@ -36,14 +36,18 @@ jobs:
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
-               version: 'v1.30.0' # 클러스터 버전에 맞춰 조정 가능
+            version: 'v1.30.0'   # 클러스터 버전에 맞춰 조정
 
-      - name: Write kubeconfig
+      - name: Build in-cluster kubeconfig (runner pod)
         run: |
-          mkdir -p ~/.kube
-          echo "${KUBECONFIG_B64}" | base64 -d > ~/.kube/config
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        set -e
+        CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        SA_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        kubectl config set-cluster in-cluster --server="${API}" --certificate-authority="${CACERT}" --embed-certs=true
+        kubectl config set-credentials sa --token="${SA_TOKEN}"
+        kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace=mlops
+        kubectl config use-context in-cluster
 
       - name: Promote in MLflow
         run: python promote.py
