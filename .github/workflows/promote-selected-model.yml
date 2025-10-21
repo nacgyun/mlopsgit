@@ -33,6 +33,18 @@ jobs:
       - name: Install deps
         run: pip install --no-cache-dir mlflow-skinny boto3
 
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+               version: 'v1.30.0' # 클러스터 버전에 맞춰 조정 가능
+
+      - name: Write kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${KUBECONFIG_B64}" | base64 -d > ~/.kube/config
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+
       - name: Promote in MLflow
         run: python promote.py
 
