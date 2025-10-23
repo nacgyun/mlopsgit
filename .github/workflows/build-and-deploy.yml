@@ -58,8 +58,8 @@ jobs:
       - name: Check runtime tag by BUILD_KEY
         id: tagcheck
         env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 권장 (없으면 자동으로 github.token 사용)
-          GITHUB_TOKEN: ${{ github.token }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 권장
+          GITHUB_TOKEN: ${{ github.token }}      # fallback
         run: |
           set -euo pipefail
           if ! command -v jq >/dev/null 2>&1; then
@@ -134,83 +134,81 @@ jobs:
           echo "IMAGE_RUNTIME_KEY=${RKEY}" >> $GITHUB_ENV
           echo "IMAGE_RUNTIME_SHA=${IMAGE_RUNTIME}-${RKEY}" >> $GITHUB_ENV
 
+      # ========= NEW: Preflight — GHCR_PAT 검증 =========
+      - name: Preflight — verify GHCR_PAT can read packages
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          OWNER_LC: ${{ env.OWNER_LC }}
+          REPO_LC:  ${{ env.REPO_LC }}
+          ACTOR:    ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_PAT:-}" ]; then
+            echo "❌ GHCR_PAT is not set. Create a classic PAT with scope read:packages (and repo if private), then add it to repo secrets."
+            exit 1
+          fi
+          curl -fsSL -u "${ACTOR}:${GHCR_PAT}" https://api.github.com/user >/dev/null || {
+            echo "❌ PAT invalid or SSO not enabled. If your org enforces SSO, click 'Enable SSO' on this PAT."
+            exit 1
+          }
+          TOKEN_JSON=$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER_LC}/${REPO_LC}:pull") || {
+            echo "❌ Failed to get registry token. Ensure package visibility/permission allows this repo/workflow to read."
+            exit 1
+          }
+          echo "$TOKEN_JSON" | jq -re '.token' >/dev/null || {
+            echo "❌ Registry token missing. Check Manage access on the package (or make it public)."
+            exit 1
+          }
+          echo "✅ GHCR_PAT looks good."
+
+      # ========= NEW: Robust digest resolution =========
       - name: Resolve GHCR digest for runtime image
         id: digest
         env:
           NS_LC: ${{ env.NS_LC }}
-          IMAGE_RUNTIME: ${{ env.IMAGE_RUNTIME }}      # ghcr.io/<owner>/<repo>:runtime
-          IMAGE_RUNTIME_KEY: ${{ env.IMAGE_RUNTIME_KEY }}  # build_key or sha
+          IMAGE_RUNTIME: ${{ env.IMAGE_RUNTIME }}
+          IMAGE_RUNTIME_KEY: ${{ env.IMAGE_RUNTIME_KEY }}
           OWNER_LC: ${{ env.OWNER_LC }}
-          REPO_LC: ${{ env.REPO_LC }}
+          REPO_LC:  ${{ env.REPO_LC }}
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
-          # 권장: read:packages scope PAT
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          # fallback: github.token (일부 상황에서 token 교환 없이 public만 접근 가능)
-          GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_ACTOR: ${{ github.actor }}
+          ACTOR:    ${{ github.actor }}
         run: |
           set -euo pipefail
 
           IMAGE_BASE="${IMAGE_RUNTIME}"                  # ghcr.io/<owner>/<repo>:runtime
-          RKEY="${IMAGE_RUNTIME_KEY}"                    # runtime-<RKEY>
+          RKEY="${IMAGE_RUNTIME_KEY}"
           IMAGE_TAGGED="${IMAGE_BASE}-${RKEY}"           # ghcr.io/<o>/<r>:runtime-<RKEY>
           REPO_PATH="$(echo "${IMAGE_TAGGED#ghcr.io/}" | cut -d: -f1)"   # <owner>/<repo>
           TAG="$(echo "${IMAGE_TAGGED}" | cut -d: -f2)"                  # runtime-<RKEY>
-
           echo "[info] Resolving digest for ${IMAGE_TAGGED}"
 
-          # -------- ① Try to parse from Kaniko logs (when we built just now) --------
+          # ① Kaniko 로그에서 시도
           DIGEST_FROM_LOG=""
           if kubectl -n "${NS_LC}" get job "${KANIKO_JOB_NAME}" >/dev/null 2>&1; then
             POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
             if [ -n "${POD:-}" ]; then
-              # Kaniko logs usually contain lines like: "digest: sha256:...."
               DIGEST_FROM_LOG="$(kubectl -n "${NS_LC}" logs "$POD" -c kaniko --tail=-1 2>/dev/null \
                 | awk '/digest:[[:space:]]*sha256:/ {print $NF}' \
                 | tail -n1 || true)"
             fi
           fi
-
           if [ -n "${DIGEST_FROM_LOG}" ]; then
             echo "[info] Got digest from Kaniko logs: ${DIGEST_FROM_LOG}"
             DIGEST="${DIGEST_FROM_LOG}"
           else
-            echo "[info] Kaniko logs not available or no digest found. Falling back to Registry API."
+            echo "[info] Falling back to Registry API with PAT"
 
-            # -------- ② Use GHCR Registry v2 with proper token --------
-            # Build a registry-scoped token. For private packages, authenticate to token service.
-            # Public packages may work without auth.
-            REG_TOKEN=""
-
-            if [ -n "${GHCR_PAT:-}" ]; then
-              # Use PAT via basic auth to get scoped registry token
-              REG_TOKEN="$(curl -fsSL \
-                -u "${GITHUB_ACTOR}:${GHCR_PAT}" \
-                "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
-                | jq -r '.token')"
-            else
-              # Try without creds (public) or with GITHUB_TOKEN (some orgs allow)
-              REG_TOKEN="$(curl -fsSL \
-                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
-                | jq -r '.token' || true)"
-              if [ -z "${REG_TOKEN}" ] || [ "${REG_TOKEN}" = "null" ]; then
-                # Last resort: anonymous (public only)
-                REG_TOKEN="$(curl -fsSL \
-                  "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
-                  | jq -r '.token' || true)"
-              fi
-            fi
-
+            REG_TOKEN="$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
+              | jq -r '.token')"
             if [ -z "${REG_TOKEN}" ] || [ "${REG_TOKEN}" = "null" ]; then
-              echo "❌ Failed to obtain GHCR registry token. Provide GHCR_PAT with read:packages."
+              echo "❌ Failed to obtain registry token. Check package permission/visibility and PAT scopes (read:packages, SSO)."
               exit 1
             fi
 
-            # Accept multiple manifest media types (single/manifest-list/OCI)
             ACCEPT_HEADER="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-
-            # HEAD may be blocked by some CDNs; use GET and read headers
             HDRS="$(mktemp)"
             curl -fsSL -D "${HDRS}" -o /dev/null \
               -H "Authorization: Bearer ${REG_TOKEN}" \
@@ -218,18 +216,15 @@ jobs:
               "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}"
 
             DIGEST="$(awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"");print $2}' "${HDRS}" | tail -n1)"
-
             if [ -z "${DIGEST}" ]; then
-              echo "❌ Docker-Content-Digest header not present. Manifest may be non-V2 or tag missing."
-              echo "   Repo path: ${REPO_PATH}  Tag: ${TAG}"
-              echo "   Response headers:"; sed -n '1,200p' "${HDRS}" || true
+              echo "❌ Docker-Content-Digest not found. Is the tag present? Check headers below."
+              sed -n '1,200p' "${HDRS}" || true
               exit 1
             fi
           fi
 
           IMAGE_REF="ghcr.io/${REPO_PATH}@${DIGEST}"
           echo "[ok] Resolved ref: ${IMAGE_REF}"
-
           {
             echo "GHCR_IMAGE=ghcr.io/${REPO_PATH}"
             echo "GHCR_TAG=${TAG}"
@@ -254,15 +249,11 @@ jobs:
               -e "s|__GHCR_IMAGE_REF__|${GHCR_IMAGE_REF}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
 
-          # 치환 누락 검증 (남아있으면 실패)
           if grep -qE "__[A-Z0-9_]+__" /tmp/train-job.yaml; then
             echo "❌ placeholder left in train-job.yaml"
             grep -nE "__[A-Z0-9_]+__" /tmp/train-job.yaml || true
             exit 1
           fi
-
-          # RFC1123 이름 검증
-          echo "${JOB_NAME}" | grep -qE '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || { echo "❌ invalid JOB_NAME=${JOB_NAME}"; exit 1; }
 
           echo "----- rendered train-job -----"; sed -n '1,240p' /tmp/train-job.yaml
 
@@ -278,7 +269,6 @@ jobs:
           set -euo pipefail
           kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=60m job/${JOB_NAME}
           POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          # 실시간 로그가 보이도록 템플릿에서 python -u / PYTHONUNBUFFERED=1 적용되어 있어야 함
           kubectl -n "${NS_LC}" logs "$POD" -c trainer --tail=300 || true
           kubectl -n "${NS_LC}" logs "$POD" -c fetch-src --tail=100 || true
 
