@@ -138,6 +138,18 @@ jobs:
           if [ -z "$RKEY" ]; then RKEY="${GIT_SHA}"; fi
           echo "IMAGE_RUNTIME_KEY=${RKEY}" >> $GITHUB_ENV
           echo "IMAGE_RUNTIME_SHA=${IMAGE_RUNTIME}-${RKEY}" >> $GITHUB_ENV
+      - name: Debug — is GHCR_PAT visible to this run?
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_PAT:-}" ]; then
+            echo "GHCR_PAT=⛔ (not set in this workflow run)"
+            echo "Tip: Repo → Settings → Secrets and variables → Actions → New secret: GHCR_PAT"
+          else
+            echo "GHCR_PAT=✅ (present for this run)"
+          fi
+
 
       # ========= NEW: Preflight — GHCR_PAT 검증 =========
       - name: Preflight — verify GHCR_PAT can read packages
