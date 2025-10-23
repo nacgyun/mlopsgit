@@ -106,6 +106,18 @@ spec:
               value: "true"
             - name: AWS_S3_FORCE_PATH_STYLE
               value: "true"
+            - name: GITHUB_RUN_ID
+              value: "__RUN_ID__"
+            - name: GIT_SHA
+              value: "__GIT_SHA__"
+            - name: GHCR_IMAGE
+              value: "__GHCR_IMAGE__"          # ghcr.io/<owner>/<repo>
+            - name: GHCR_TAG
+              value: "__GHCR_TAG__"            # runtime-<BUILD_KEY or SHA>
+            - name: GHCR_DIGEST
+              value: "__GHCR_DIGEST__"         # sha256:....
+            - name: GHCR_IMAGE_REF
+              value: "__GHCR_IMAGE_REF__"      # ghcr.io/<owner>/<repo>@sha256:....
           envFrom:
             - secretRef:
                 name: s3-mlflow-creds

@@ -17,6 +17,7 @@ from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, log_loss
 from sklearn.linear_model import SGDClassifier
+from pathlib import Path
 
 # ===== 파라미터 / 설정 =====
 EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
@@ -58,7 +59,6 @@ def log_json_line(payload: dict):
     try:
         print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     except Exception:
-        # JSON 직렬화 실패해도 학습은 계속
         pass
 
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
@@ -157,6 +157,45 @@ def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_dea
         )
         rng_seed += 1
 
+# === NEW: GHCR 메타데이터를 MLflow 태그/아티팩트로 남기는 헬퍼 ===
+def log_ghcr_metadata_to_mlflow():
+    """
+    GHCR 관련 ENV를 읽어 MLflow 태그로 저장.
+    또한 (선택) 동일 내용을 build/image.json으로 기록해 아티팩트 업로드.
+    """
+    ghcr_image   = os.getenv("GHCR_IMAGE", "")        # ghcr.io/<owner>/<repo>
+    ghcr_tag     = os.getenv("GHCR_TAG", "")          # runtime-<BUILD_KEY or SHA>
+    ghcr_digest  = os.getenv("GHCR_DIGEST", "")       # sha256:...
+    ghcr_ref     = os.getenv("GHCR_IMAGE_REF", "")    # ghcr.io/...@sha256:...
+    run_id_ci    = os.getenv("GITHUB_RUN_ID", "")
+    git_sha      = os.getenv("GIT_SHA", "")
+
+    # 태그로 기록 (UI/검색용)
+    mlmod.set_tag("ci.run_id", run_id_ci)
+    mlmod.set_tag("git.sha",   git_sha)
+    mlmod.set_tag("ghcr.image",  ghcr_image)
+    mlmod.set_tag("ghcr.tag",    ghcr_tag)
+    mlmod.set_tag("ghcr.digest", ghcr_digest)
+    mlmod.set_tag("ghcr.ref",    ghcr_ref)
+
+    # (선택) 아티팩트 JSON도 남김 → MinIO에서 바로 파싱 가능
+    try:
+        meta = {
+            "image": ghcr_image,
+            "tag": ghcr_tag,
+            "digest": ghcr_digest,
+            "ref": ghcr_ref,
+            "run_id": run_id_ci,
+            "git_sha": git_sha
+        }
+        Path("build").mkdir(exist_ok=True)
+        with open("build/image.json", "w") as f:
+            json.dump(meta, f, indent=2)
+        mlmod.log_artifact("build/image.json", artifact_path="build")
+    except Exception:
+        # 아티팩트 기록 실패해도 학습은 계속
+        pass
+
 def main():
     wall_start = time.perf_counter()
 
@@ -186,6 +225,9 @@ def main():
     with start_run_with_retry(exp_id, RUN_NAME) as run:
         run_id = run.info.run_id
         print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
+
+        # === NEW: GHCR 메타데이터를 RUN 시작 직후 기록 ===
+        log_ghcr_metadata_to_mlflow()
 
         mlmod.log_params({
             "model": "SGDClassifier(logistic)",
@@ -259,8 +301,6 @@ def main():
                 ema = EMA_ALPHA * compute_sec + (1 - EMA_ALPHA) * ema
 
             elapsed = time.perf_counter() - wall_start
-            remaining_epochs = EPOCHS - epoch
-            # 👉 남은 예상 시간(초) — 목표 벽시계 시간 기준
             eta_sec = max(0.0, TARGET_WALL_SEC - elapsed)
 
             mlmod.log_metrics({
@@ -270,22 +310,20 @@ def main():
                 "epoch_compute_sec": compute_sec,
                 "epoch_sleep_sec": SLEEP_SEC,
                 "epoch_time_sec": compute_sec + SLEEP_SEC,
-                "eta_sec": eta_sec,                 # MLflow에도 남김
+                "eta_sec": eta_sec,
                 "progress_pct": min(99.9, 100.0 * epoch / EPOCHS),
                 "elapsed_sec": elapsed
             }, step=epoch)
 
             f1_hist.append(f1)
-            # ── 사람이 읽는 로그
             print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
                   f"sleep={SLEEP_SEC:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
-            # ── Loki용 JSON 로그 (대시보드 패널이 이 값을 unwrap)
             log_json_line({
                 "event": "epoch_metric",
                 "epoch": epoch,
                 "accuracy": acc,
-                "duration": round(compute_sec + SLEEP_SEC, 4),  # 에폭 총 시간(참고)
-                "remaining_sec": round(eta_sec, 1),             # ✅ 남은 예상 시간(초)
+                "duration": round(compute_sec + SLEEP_SEC, 4),
+                "remaining_sec": round(eta_sec, 1),
                 "run_id": run_id,
                 "experiment": EXP_NAME,
             })
@@ -358,7 +396,7 @@ def main():
             "event": "train_done",
             "accuracy": float(accuracy_score(y_test, clf.predict(X_test))),
             "duration": round(total_time, 4),
-            "remaining_sec": 0.0,                 # ✅ 종료 시 0으로 고정
+            "remaining_sec": 0.0,
             "run_id": run_id,
             "experiment": EXP_NAME,
         })
