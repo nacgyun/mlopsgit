@@ -5,6 +5,11 @@ on:
   push:
     branches: [ master ]
 
+# GitHub 발급 GITHUB_TOKEN 권한 (패키지 읽기 허용)
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   train-build-run:
     runs-on: [self-hosted, k8s]
@@ -58,8 +63,8 @@ jobs:
       - name: Check runtime tag by BUILD_KEY
         id: tagcheck
         env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 권장
-          GITHUB_TOKEN: ${{ github.token }}      # fallback
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 권장 (없으면 fallback로 github.token 사용하지만 비공개 패키지엔 부족)
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if ! command -v jq >/dev/null 2>&1; then
@@ -285,4 +290,4 @@ jobs:
           kubectl -n "${NS_LC}" logs "${POD}" -c fetch-src --tail=200 || true
           echo "---- trainer logs ----"
           kubectl -n "${NS_LC}" logs "${POD}" -c trainer --tail=500 || true
-
+   
