@@ -8,7 +8,7 @@ on:
         required: true
         default: "light-logreg"
       run_id:
-        description: "RUN_ID from MLflow UI (the training run you want to promote/deploy)"
+        description: "RUN_ID from MLflow UI (the training run you want to deploy)"
         required: true
       serve_stage:
         description: "Stage to serve (ex. Production)"
@@ -34,12 +34,12 @@ jobs:
 
     steps:
       #######################################################################
-      # 0. checkout (need promote.py in repo)
+      # 0. checkout (just so we have repo for context, not using promote.py anymore)
       #######################################################################
       - uses: actions/checkout@v4
 
       #######################################################################
-      # 1. python runtime (we'll talk to MLflow)
+      # 1. python runtime (we'll talk to MLflow ourselves)
       #######################################################################
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -90,12 +90,17 @@ jobs:
           kubectl config use-context in-cluster
 
       #######################################################################
-      # 4. Promote that RUN_ID into the model registry stage.
-      #    promote.py is expected to:
-      #      - register runs:/<RUN_ID>/model into MODEL_NAME
-      #      - transition that version to SERVE_STAGE (Production, etc.)
+      # 4. Promote RUN_ID into the model registry stage (inline, not promote.py)
+      #
+      # Logic:
+      #   - register runs:/<RUN_ID>/model as a new version of MODEL_NAME (if not already)
+      #   - transition that model version to SERVE_STAGE (Production, etc.)
+      #
+      # We:
+      #   * don't raise if it already exists
+      #   * don't block forever
       #######################################################################
-      - name: Promote MLflow model/version
+      - name: Promote MLflow model/version (inline)
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
           MODEL_NAME: ${{ env.MODEL_NAME }}
@@ -103,15 +108,73 @@ jobs:
           SERVE_STAGE: ${{ env.SERVE_STAGE }}
         run: |
           set -euo pipefail
-          echo "[info] Promoting RUN_ID=${RUN_ID} -> ${MODEL_NAME} stage=${SERVE_STAGE}"
-          python promote.py
-          echo "[info] Promote done."
+          python - << 'PYCODE'
+          import os, time, mlflow
+          from mlflow.tracking import MlflowClient
+          from mlflow.exceptions import MlflowException
+
+          tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
+          model_name   = os.environ["MODEL_NAME"]
+          run_id       = os.environ["RUN_ID"]
+          stage        = os.environ["SERVE_STAGE"]
+
+          mlflow.set_tracking_uri(tracking_uri)
+          client = MlflowClient(tracking_uri=tracking_uri)
+
+          # model_uri that we want to register
+          model_uri = f"runs:/{run_id}/model"
+          print(f"[promote] registering {model_uri} -> {model_name}")
+
+          version_num = None
+
+          # try to register new version
+          try:
+              mv = mlflow.register_model(model_uri=model_uri, name=model_name)
+              version_num = mv.version
+              print(f"[promote] registered new version={version_num}")
+          except MlflowException as e:
+              # Possible it's already registered with same source.
+              # We'll just try to find an existing version pointing to this run_id.
+              print(f"[promote] register_model exception: {e}")
+              print("[promote] trying to find existing model version for this run_id ...")
+              for mv in client.search_model_versions(f"name='{model_name}'"):
+                  # mv has .run_id and .version
+                  if mv.run_id == run_id:
+                      version_num = mv.version
+                      print(f"[promote] found existing version={version_num} for run_id")
+                      break
+
+          if version_num is None:
+              # last ditch: pick the highest version (best guess)
+              all_versions = client.search_model_versions(f"name='{model_name}'")
+              if all_versions:
+                  # sort by int(version) descending
+                  all_versions.sort(key=lambda m:int(m.version), reverse=True)
+                  version_num = all_versions[0].version
+                  print(f"[promote] fallback using latest version={version_num}")
+              else:
+                  raise RuntimeError("No model version could be determined at all")
+
+          # now transition to stage
+          print(f"[promote] transition v{version_num} -> stage={stage}")
+          try:
+              client.transition_model_version_stage(
+                  name=model_name,
+                  version=version_num,
+                  stage=stage,
+                  archive_existing_versions=False,
+              )
+          except MlflowException as e:
+              print(f"[promote] transition warning: {e}")
+
+          print("[promote] done.")
+          PYCODE
 
       #######################################################################
-      # 5. Read GHCR image info from MLflow run tags
+      # 5. Resolve GHCR image info from MLflow run tags
       #
-      # train.py should be tagging:
-      #   ghcr.ref         (preferred full ref, e.g. ghcr.io/...:runtime-<hash> or with @sha256)
+      # train.py logs these run tags:
+      #   ghcr.ref         (preferred, e.g. ghcr.io/...:runtime-<hash> or with @sha256)
       #   ghcr.image
       #   ghcr.digest
       #   ghcr.tag
@@ -160,7 +223,7 @@ jobs:
               reason = "fallback-none"
 
           print(f"[resolve_image] RUN_ID={run_id}")
-          print(f"[resolve_image] SERVE_IMAGE={serve_image} (from {reason})", file=sys.stderr)
+          print(f"[resolve_image] SERVE_IMAGE={serve_image} ({reason})", file=sys.stderr)
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"SERVE_IMAGE={serve_image}\n")
@@ -175,8 +238,7 @@ jobs:
       #######################################################################
       # 6. Make sure env vars needed for mlflow models serve to pull from MinIO
       #
-      # This only ensures static envs (endpoint, region, path style).
-      # We assume minio creds are already present in Deployment as secretKeyRef.
+      # We assume the Deployment already has the MinIO creds secret env injected.
       #######################################################################
       - name: Ensure MLflow/MinIO env on Deployment
         env:
@@ -193,21 +255,17 @@ jobs:
             || true
 
       #######################################################################
-      # 7. Now we do the IMPORTANT part:
+      # 7. Force fresh pod:
       #
-      #    (a) scale the Deployment to 0 so old pod goes away.
-      #    (b) patch Deployment template so that:
-      #        - replicas=1 "later"
-      #        - container image (if resolved)
-      #        - container command/args to serve the stage we just promoted
-      #        - ports, probes, resources
-      #    (c) update workflows/restartedAt annotation using "replace", and
-      #        if replace fails (first run?), try "add".
+      #    (a) scale the Deployment to 0 (old pod dies)
+      #    (b) patch Deployment template:
+      #        - container command/args -> mlflow models serve with MODEL_NAME & SERVE_STAGE
+      #        - container image -> SERVE_IMAGE (if we resolved one)
+      #        - health probes / resources / port
+      #    (c) bump workflows/restartedAt annotation so PodTemplateHash changes
       #    (d) scale back up to 1
-      #
-      # => This guarantees a fresh pod every run_id even if image didn't change.
       #######################################################################
-      - name: Reconcile Deployment spec (image/cmd/probes) + restart
+      - name: Reconcile Deployment and restart fresh pod
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
@@ -219,13 +277,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "[info] scaling ${SERVE_DEPLOY} to 0 first..."
+          echo "[reconcile] scale ${SERVE_DEPLOY} -> 0"
           kubectl -n "${NAMESPACE}" scale deploy "${SERVE_DEPLOY}" --replicas=0
 
           CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
-          echo "[info] new CMD: ${CMD}"
+          echo "[reconcile] new CMD: ${CMD}"
 
-          # patch command/args/ports/resources/probes
+          # Patch command/args/ports/resources/probes
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",
              \"value\":[\"sh\",\"-c\"]},
@@ -272,9 +330,9 @@ jobs:
              }}
           ]"
 
-          # patch image IF we resolved SERVE_IMAGE from the run
+          # Patch image if we have SERVE_IMAGE from MLflow run tags
           if [ -n "${SERVE_IMAGE}" ]; then
-            echo "[info] patching container image -> ${SERVE_IMAGE}"
+            echo "[reconcile] patching image -> ${SERVE_IMAGE}"
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
               {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",
                \"value\":\"${SERVE_IMAGE}\"}
@@ -283,11 +341,9 @@ jobs:
             echo "::warning ::no SERVE_IMAGE resolved, keeping existing image"
           fi
 
-          # bump workflows/restartedAt so the pod template hash changes every run
+          # bump annotation workflows/restartedAt to force new template hash
           TS=$(date +%s)
-          echo "[info] bumping workflows/restartedAt=${TS}"
-
-          # try replace first
+          echo "[reconcile] bump workflows/restartedAt=${TS}"
           set +e
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",
@@ -297,7 +353,7 @@ jobs:
           RC=$?
           set -e
           if [ $RC -ne 0 ]; then
-            echo "[warn] replace failed, falling back to add"
+            echo "[reconcile] replace failed, doing add instead"
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
               {\"op\":\"add\",
                \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
@@ -305,11 +361,11 @@ jobs:
             ]"
           fi
 
-          echo "[info] scaling ${SERVE_DEPLOY} back to 1..."
+          echo "[reconcile] scale ${SERVE_DEPLOY} -> 1"
           kubectl -n "${NAMESPACE}" scale deploy "${SERVE_DEPLOY}" --replicas=1
 
       #######################################################################
-      # 8. Wait until rollout is healthy (new pod should now spawn fresh)
+      # 8. Wait until rollout is healthy
       #######################################################################
       - name: Wait for rollout
         env:
@@ -318,6 +374,6 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n "${NAMESPACE}" rollout status deploy/${SERVE_DEPLOY} --timeout=300s
-          echo "[info] Pods after rollout:"
+          echo "[done] final pods:"
           kubectl -n "${NAMESPACE}" get pods -l app=${SERVE_DEPLOY} -o wide
 
