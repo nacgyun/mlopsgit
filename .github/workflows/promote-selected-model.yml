@@ -32,6 +32,12 @@ jobs:
       RUN_ID: ${{ inputs.run_id }}
       SERVE_STAGE: ${{ inputs.serve_stage }}
 
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      MLFLOW_S3_ENDPOINT_URL: http://10.100.0.101:32091
+
     steps:
       #######################################################################
       # 0. Checkout repo (promote.py 안 써도 되지만 깃 SHA 등 참고용)
