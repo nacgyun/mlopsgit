@@ -23,9 +23,9 @@ jobs:
       # K8s
       NAMESPACE: mlops
       SERVE_DEPLOY: light-serve
-      SERVE_CONTAINER_INDEX: "0"   # serve 컨테이너 인덱스(0이 아니면 바꾸세요)
+      SERVE_CONTAINER_INDEX: "0"    # serve 컨테이너 인덱스(0이 아니면 조정)
       SERVE_PORT: "8000"
-      SERVE_STAGE: Production       # MODEL_URI는 models:/<MODEL_NAME>/<SERVE_STAGE>
+      SERVE_STAGE: Production        # MODEL_URI = models:/<MODEL_NAME>/<SERVE_STAGE>
 
       # MLflow
       MLFLOW_TRACKING_URI: http://mlflow.mlops.svc.cluster.local:5000
@@ -59,11 +59,11 @@ jobs:
           kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace=${NAMESPACE}
           kubectl config use-context in-cluster
 
-      # 1) 선택 RUN을 Registry로 승격 (기존 promote.py 사용)
+      # 1) 선택 RUN 승격 (기존 promote.py 사용; 모델 버전/스테이지 전환)
       - name: Promote in MLflow (runs:/<RUN_ID>/model)
         run: python promote.py
 
-      # 2) MLflow RUN 태그에서 GHCR 이미지(ref 우선) 결정
+      # 2) MLflow RUN 태그에서 GHCR 이미지 결정 (ref > image@digest > image:tag)
       - name: Resolve GHCR image from MLflow RUN tags
         id: resolve_image
         env:
@@ -99,8 +99,8 @@ jobs:
             echo "Using SERVE_IMAGE=${SERVE_IMAGE} (source=${SERVE_IMAGE_REASON})"
           fi
 
-      # 3) 배포 정규화(핵심): replicas, command/args, port name, probes, resources, MODEL_URI
-      - name: Normalize serve Deployment (no pip install, proper probes/port/resources)
+      # 3) 배포 정규화: replicas/command/args/port/probes/resources/MODEL_URI/S3
+      - name: Normalize serve Deployment (no pip install; stable probes/resources)
         run: |
           set -euo pipefail
           DEPLOY="$(kubectl -n "${NAMESPACE}" get deploy -o name | grep "^deployment.apps/${SERVE_DEPLOY}$" || true)"
@@ -108,39 +108,66 @@ jobs:
             echo "❌ Deployment ${SERVE_DEPLOY} not found in ${NAMESPACE}"; exit 1
           fi
 
-          # (A) 복제수 1로 축소(롤링 충돌 방지). 필요하면 나중에 늘리세요.
-          kubectl -n "${NAMESPACE}" scale deploy/${SERVE_DEPLOY} --replicas=1
+          # A) replicas=1 (원하면 나중에 수평확장)
+          kubectl -n "${NAMESPACE}" scale deploy/${SERVE_DEPLOY} --replicas=1 || true
 
           IDX="${SERVE_CONTAINER_INDEX:-0}"
 
-          # (B) 실행 커맨드 고정: mlflow models serve -m $(MODEL_URI) --host 0.0.0.0 --port 8000 --env-manager local
+          # B) 실행 커맨드 고정: mlflow models serve -m $(MODEL_URI) --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local
           kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${IDX}/command\",\"value\":[\"mlflow\"]},
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${IDX}/args\",\"value\":[\"models\",\"serve\",\"-m\",\"$(MODEL_URI)\",\"--host\",\"0.0.0.0\",\"--port\",\"${SERVE_PORT}\",\"--env-manager\",\"local\"]}
           ]"
 
-          # (C) port name=http 보장
+          # C) port name=http 보장
           kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p="[
             {\"op\":\"add\",\"path\":\"/spec/template/spec/containers/${IDX}/ports\",\"value\":[{\"containerPort\":${SERVE_PORT},\"name\":\"http\"}]}
           ]" || kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${IDX}/ports\",\"value\":[{\"containerPort\":${SERVE_PORT},\"name\":\"http\"}]}
           ]"
 
-          # (D) startup/readiness/liveness 프로브 튜닝
+          # D) startup/readiness/liveness 프로브 튜닝
           kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
+            {"op":"add","path":"/spec/template/spec/containers/'"${IDX}"'/startupProbe","value":{
+              "httpGet":{"path":"/ping","port":"http"},
+              "initialDelaySeconds":30,
+              "periodSeconds":5,
+              "timeoutSeconds":3,
+              "failureThreshold":120
+            }}
+          ]' || kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
             {"op":"replace","path":"/spec/template/spec/containers/'"${IDX}"'/startupProbe","value":{
               "httpGet":{"path":"/ping","port":"http"},
               "initialDelaySeconds":30,
               "periodSeconds":5,
               "timeoutSeconds":3,
               "failureThreshold":120
-            }},
+            }}
+          ]'
+          kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
+            {"op":"add","path":"/spec/template/spec/containers/'"${IDX}"'/readinessProbe","value":{
+              "httpGet":{"path":"/ping","port":"http"},
+              "periodSeconds":5,
+              "timeoutSeconds":2,
+              "failureThreshold":6
+            }}
+          ]' || kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
             {"op":"replace","path":"/spec/template/spec/containers/'"${IDX}"'/readinessProbe","value":{
               "httpGet":{"path":"/ping","port":"http"},
               "periodSeconds":5,
               "timeoutSeconds":2,
               "failureThreshold":6
-            }},
+            }}
+          ]'
+          kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
+            {"op":"add","path":"/spec/template/spec/containers/'"${IDX}"'/livenessProbe","value":{
+              "httpGet":{"path":"/ping","port":"http"},
+              "initialDelaySeconds":60,
+              "periodSeconds":10,
+              "timeoutSeconds":2,
+              "failureThreshold":3
+            }}
+          ]' || kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
             {"op":"replace","path":"/spec/template/spec/containers/'"${IDX}"'/livenessProbe","value":{
               "httpGet":{"path":"/ping","port":"http"},
               "initialDelaySeconds":60,
@@ -150,25 +177,30 @@ jobs:
             }}
           ]'
 
-          # (E) 리소스 여유 (Exit 137 방지)
+          # E) 리소스 여유 (Exit 137 방지)
           kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
+            {"op":"add","path":"/spec/template/spec/containers/'"${IDX}"'/resources","value":{
+              "requests":{"cpu":"200m","memory":"512Mi"},
+              "limits":{"cpu":"1","memory":"1Gi"}
+            }}
+          ]' || kubectl -n "${NAMESPACE}" patch ${DEPLOY} --type='json' -p='[
             {"op":"replace","path":"/spec/template/spec/containers/'"${IDX}"'/resources","value":{
               "requests":{"cpu":"200m","memory":"512Mi"},
               "limits":{"cpu":"1","memory":"1Gi"}
             }}
           ]'
 
-          # (F) S3/MinIO 환경 보장 (중복 줄이기; 필요 없는 항목은 빼도 됨)
+          # F) S3/MinIO 환경 보장
           kubectl -n "${NAMESPACE}" set env deploy/${SERVE_DEPLOY} \
             MLFLOW_S3_ENDPOINT_URL="http://minio.${NAMESPACE}.svc.cluster.local:9000" \
             AWS_DEFAULT_REGION="us-east-1" \
             AWS_S3_FORCE_PATH_STYLE="true"
 
-          # (G) MODEL_URI 스테이지 통일
+          # G) MODEL_URI 스테이지 통일
           kubectl -n "${NAMESPACE}" set env deploy/${SERVE_DEPLOY} \
             MODEL_URI="models:/${MODEL_NAME}/${SERVE_STAGE}"
 
-      # 4) MLflow로부터 계산된 GHCR 이미지로 컨테이너 이미지 교체
+      # 4) MLflow 태그로 결정된 GHCR 이미지로 교체
       - name: Patch serve image (from MLflow RUN tags)
         if: ${{ env.SERVE_IMAGE != '' }}
         run: |
@@ -180,16 +212,31 @@ jobs:
           ]"
           echo "Patched image to ${SERVE_IMAGE}"
 
-      # 5) 롤아웃 재시작/상태 확인
+      # 5) 항상 새 ReplicaSet 생성되도록 템플릿 강제 bump
+      - name: Force template bump (always trigger new ReplicaSet)
+        run: |
+          set -e
+          TS=$(date +%s)
+          kubectl -n "${NAMESPACE}" patch deploy/${SERVE_DEPLOY} -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"workflows/restartedAt\":\"${TS}\",\"workflows/run-id\":\"${{ github.run_id }}\"}}}}}"
+          kubectl -n "${NAMESPACE}" get deploy ${SERVE_DEPLOY} -o wide
+
+      # 6) 롤아웃 재시작/상태/디버그 출력
       - name: Rollout restart serve
         if: ${{ inputs.reload_method == 'rollout' || env.SERVE_IMAGE != '' }}
         run: |
           set -e
-          kubectl -n "${NAMESPACE}" rollout restart deploy/${SERVE_DEPLOY}
+          kubectl -n "${NAMESPACE}" rollout restart deploy/${SERVE_DEPLOY} || true
+          echo "=== Deployment ==="
+          kubectl -n "${NAMESPACE}" get deploy ${SERVE_DEPLOY} -o wide
+          echo "=== ReplicaSets ==="
+          kubectl -n "${NAMESPACE}" get rs -l app=${SERVE_DEPLOY} -o wide
+          echo "=== Pods (before wait) ==="
+          kubectl -n "${NAMESPACE}" get pods -l app=${SERVE_DEPLOY} -o wide || true
           kubectl -n "${NAMESPACE}" rollout status  deploy/${SERVE_DEPLOY} --timeout=600s
+          echo "=== Pods (after wait) ==="
           kubectl -n "${NAMESPACE}" get pods -l app=${SERVE_DEPLOY} -o wide
 
-      # 6) (옵션) HTTP 핫 리로드가 구현돼 있다면
+      # 7) (옵션) HTTP 핫 리로드 엔드포인트가 있다면
       - name: Call /reload on light-serve (HTTP) [optional]
         if: ${{ inputs.reload_method == 'http' }}
         run: |
