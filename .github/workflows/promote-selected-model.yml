@@ -10,26 +10,27 @@ on:
       run_id:
         description: "RUN_ID to promote (copy from MLflow UI)"
         required: true
-      reload_method:
-        description: "How to refresh serve (rollout|http)"
+      serve_stage:
+        description: "Model registry stage to serve (normally Production)"
         required: true
-        default: "rollout"
+        default: "Production"
 
 jobs:
   promote:
     runs-on: self-hosted
 
     env:
-      # K8s config
+      # ---- K8s cluster config ----
       NAMESPACE: mlops
       SERVE_DEPLOY: light-serve
+      SERVE_CONTAINER_INDEX: "0"
       SERVE_PORT: "8000"
-      SERVE_STAGE: Production        # will serve models:/<MODEL_NAME>/<SERVE_STAGE>
 
-      # MLflow config
+      # ---- MLflow / Model Registry ----
       MLFLOW_TRACKING_URI: http://mlflow.mlops.svc.cluster.local:5000
       MODEL_NAME: ${{ inputs.model_name }}
       RUN_ID: ${{ inputs.run_id }}
+      SERVE_STAGE: ${{ inputs.serve_stage }}
 
     steps:
       - uses: actions/checkout@v4
@@ -40,224 +41,209 @@ jobs:
           python-version: '3.11'
 
       - name: Install deps (runner side)
-        run: pip install --no-cache-dir mlflow-skinny
+        run: |
+          pip install --no-cache-dir mlflow-skinny boto3 kubernetes pyyaml
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: 'v1.30.0'
 
-      - name: Build in-cluster kubeconfig (runner pod)
+      - name: Build in-cluster kubeconfig (self-hosted runner is already inside k8s)
         run: |
           set -e
           CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
           SA_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
           API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-          kubectl config set-cluster in-cluster --server="${API}" --certificate-authority="${CACERT}" --embed-certs=true
+
+          kubectl config set-cluster in-cluster \
+            --server="${API}" \
+            --certificate-authority="${CACERT}" \
+            --embed-certs=true
+
           kubectl config set-credentials sa --token="${SA_TOKEN}"
-          kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace=${NAMESPACE}
+
+          kubectl config set-context in-cluster \
+            --cluster=in-cluster \
+            --user=sa \
+            --namespace=${NAMESPACE}
+
           kubectl config use-context in-cluster
 
-      # 1) Promote the chosen RUN_ID into the registry (ModelVersion stage bump etc.)
-      - name: Promote in MLflow (runs:/<RUN_ID>/model)
-        run: python promote.py
+      # 1) MLflow Model Registry promote:
+      #    여기서 promote.py는 "RUN_ID -> MODEL_NAME/SERVE_STAGE 로 등록/업데이트" 역할을 한다고 가정.
+      - name: Promote in MLflow (runs:/<RUN_ID>/model -> $SERVE_STAGE)
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+          RUN_ID: ${{ env.RUN_ID }}
+          SERVE_STAGE: ${{ env.SERVE_STAGE }}
+        run: |
+          set -euo pipefail
+          python promote.py
 
-      # 2) Resolve which GHCR image we should serve for this RUN_ID
-      - name: Resolve GHCR image from MLflow RUN tags
+      # 2) Resolve GHCR image from MLflow run tags for this RUN_ID
+      #
+      #    이 스텝이 핵심이야: run_id만 알면 자동으로 SERVE_IMAGE를 찾아서 GITHUB_ENV에 쓴다.
+      - name: Resolve serve image from MLflow RUN tags
         id: resolve_image
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
           RUN_ID: ${{ env.RUN_ID }}
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python - << 'PYCODE'
           import os, sys, mlflow
-          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
-          run = mlflow.get_run(os.environ["RUN_ID"])
-          tags = run.data.tags
 
-          ref    = (tags.get("ghcr.ref")    or "").strip()
-          image  = (tags.get("ghcr.image")  or "").strip()
-          digest = (tags.get("ghcr.digest") or "").strip()
-          tag    = (tags.get("ghcr.tag")    or "").strip()
+          tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
+          run_id = os.environ["RUN_ID"]
+
+          mlflow.set_tracking_uri(tracking_uri)
+          run = mlflow.get_run(run_id)
+          tags = run.data.tags or {}
+
+          # 우선순위:
+          #   1) ghcr.ref  (예: ghcr.io/org/repo:runtime-deadbeef  또는 ghcr.io/org/repo@sha256:abcd...)
+          #   2) ghcr.image + ghcr.digest (image@digest)
+          #   3) ghcr.image + ghcr.tag    (image:tag)
+          #   fallback: "" (skip patching image if we can't resolve)
+
+          ref     = tags.get("ghcr.ref", "") or ""
+          image   = tags.get("ghcr.image", "") or ""
+          digest  = tags.get("ghcr.digest", "") or ""
+          tag     = tags.get("ghcr.tag", "") or ""
+
+          serve_image = ""
+          reason = ""
 
           if ref:
-              out, reason = ref, "ghcr.ref"
+              serve_image = ref.strip()
+              reason = "ghcr.ref"
           elif image and digest:
-              out, reason = f"{image}@{digest}", "image+digest"
+              serve_image = f"{image.strip()}@{digest.strip()}"
+              reason = "image+digest"
           elif image and tag:
-              out, reason = f"{image}:{tag}", "image+tag"
+              serve_image = f"{image.strip()}:{tag.strip()}"
+              reason = "image+tag"
           else:
-              out, reason = "", "fallback-none"
+              serve_image = ""
+              reason = "fallback-none"
 
-          print(f"[resolve_image] SERVE_IMAGE={out} reason={reason}", file=sys.stderr)
+          # 출력은 stderr로 남겨서 Actions 로그에서 확인 가능
+          print(f"[resolve_image] RUN_ID={run_id} SERVE_IMAGE={serve_image} source={reason}", file=sys.stderr)
 
+          # GITHUB_ENV 에 써서 이후 step에서 참조 가능하게 함
           with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"SERVE_IMAGE={out}\n")
+              f.write(f"SERVE_IMAGE={serve_image}\n")
               f.write(f"SERVE_IMAGE_REASON={reason}\n")
-          PY
+          PYCODE
 
           if [ -z "${SERVE_IMAGE}" ]; then
-            echo "::warning ::Could not resolve GHCR image for RUN_ID=${RUN_ID} from MLflow tags. We'll keep current image."
+            echo "::warning ::Could not resolve SERVE_IMAGE from MLflow run tags. We'll keep the current Deployment image."
           else
-            echo "Using SERVE_IMAGE=${SERVE_IMAGE} (source=${SERVE_IMAGE_REASON})"
+            echo "Resolved SERVE_IMAGE=${SERVE_IMAGE} (${SERVE_IMAGE_REASON})"
           fi
 
-      # 3) Normalize Deployment spec in ONE strategic merge patch:
-      #    - replicas=1 (so we don't keep 2 pods from 2 ReplicaSets)
-      #    - container 'server' runs mlflow models serve directly (no pip install, no exit-after-boot)
-      #    - probes hit /ping on named port http
-      #    - requests/limits sane
-      #    - env includes: tracking URI, S3/MinIO, AWS creds from secret
-      #
-      #    NOTE: we inline the actual model URI ("models:/<MODEL_NAME>/<SERVE_STAGE>") directly
-      #    into the serve command string. No "$(MODEL_URI)" indirection, no shell expansion required.
-      - name: Normalize serve Deployment spec (strategic merge patch)
+      # 3) Ensure env vars (MinIO/S3 creds, etc.) exist on Deployment
+      #    최소한 endpoint / creds가 serve pod 안에 주입되도록 보장.
+      - name: Ensure MinIO/MLflow env on serve Deployment
+        env:
+          NAMESPACE: ${{ env.NAMESPACE }}
+          SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
         run: |
           set -euo pipefail
-          NS="${NAMESPACE}"
-          DEPLOY="${SERVE_DEPLOY}"
-          PORT="${SERVE_PORT}"
-          MODEL_URI_VALUE="models:/${MODEL_NAME}/${SERVE_STAGE}"
+          kubectl -n "${NAMESPACE}" set env deploy/${SERVE_DEPLOY} \
+            MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI} \
+            MLFLOW_S3_ENDPOINT_URL=http://minio.${NAMESPACE}.svc.cluster.local:9000 \
+            AWS_DEFAULT_REGION=us-east-1 \
+            AWS_S3_FORCE_PATH_STYLE=true \
+            || true
 
-          SERVE_CMD="mlflow models serve -m ${MODEL_URI_VALUE} --host 0.0.0.0 --port ${PORT} --env-manager local"
+          # access key/secret key는 이미 Deployment에 minio-creds로 박혀있다고 가정.
+          # 없다면 여기서 json patch로 envFrom/secretKeyRef 추가하는 로직 넣을 수 있음.
 
-          kubectl -n "${NS}" patch deploy "${DEPLOY}" -p "{
-            \"spec\": {
-              \"replicas\": 1,
-              \"template\": {
-                \"spec\": {
-                  \"containers\": [
-                    {
-                      \"name\": \"server\",
-                      \"image\": \"ghcr.io/mlflow/mlflow:latest\",
-                      \"command\": [\"sh\",\"-c\"],
-                      \"args\": [\"${SERVE_CMD}\"],
-                      \"ports\": [
-                        {\"containerPort\": ${PORT}, \"name\": \"http\"}
-                      ],
-                      \"startupProbe\": {
-                        \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-                        \"initialDelaySeconds\": 30,
-                        \"periodSeconds\": 5,
-                        \"timeoutSeconds\": 3,
-                        \"failureThreshold\": 120
-                      },
-                      \"readinessProbe\": {
-                        \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-                        \"periodSeconds\": 5,
-                        \"timeoutSeconds\": 2,
-                        \"failureThreshold\": 6
-                      },
-                      \"livenessProbe\": {
-                        \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-                        \"initialDelaySeconds\": 60,
-                        \"periodSeconds\": 10,
-                        \"timeoutSeconds\": 2,
-                        \"failureThreshold\": 3
-                      },
-                      \"resources\": {
-                        \"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},
-                        \"limits\":   {\"cpu\": \"1\",    \"memory\": \"1Gi\"}
-                      },
-                      \"env\": [
-                        {\"name\": \"MLFLOW_TRACKING_URI\",     \"value\": \"http://mlflow.${NS}.svc.cluster.local:5000\"},
-                        {\"name\": \"MLFLOW_S3_ENDPOINT_URL\",  \"value\": \"http://minio.${NS}.svc.cluster.local:9000\"},
-                        {\"name\": \"AWS_DEFAULT_REGION\",      \"value\": \"us-east-1\"},
-                        {\"name\": \"AWS_S3_FORCE_PATH_STYLE\", \"value\": \"true\"},
-                        {\"name\": \"AWS_ACCESS_KEY_ID\",
-                         \"valueFrom\": {\"secretKeyRef\": {\"name\": \"minio-creds\", \"key\": \"accessKey\"}}},
-                        {\"name\": \"AWS_SECRET_ACCESS_KEY\",
-                         \"valueFrom\": {\"secretKeyRef\": {\"name\": \"minio-creds\", \"key\": \"secretKey\"}}}
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          }"
-
-          echo "=== Deployment after normalize ==="
-          kubectl -n "${NS}" get deploy "${DEPLOY}" -o yaml | sed -n '1,200p'
-
-      # 4) If we successfully resolved SERVE_IMAGE from the RUN's MLflow tags,
-      #    override the container image to that (immutable runtime image with all deps)
-      - name: Patch serve image (from MLflow RUN tags)
-        if: ${{ env.SERVE_IMAGE != '' }}
+      # 4) Patch Deployment template with:
+      #    - correct image (SERVE_IMAGE)
+      #    - correct command/args pointing to Production (or chosen SERVE_STAGE)
+      #    - probes, ports, resources
+      #    이 patch는 "server" 컨테이너만 바꾼다.
+      - name: Patch serve Deployment spec (image, command, args, probes, resources)
+        env:
+          NAMESPACE: ${{ env.NAMESPACE }}
+          SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
+          SERVE_CONTAINER_INDEX: ${{ env.SERVE_CONTAINER_INDEX }}
+          SERVE_PORT: ${{ env.SERVE_PORT }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+          SERVE_STAGE: ${{ env.SERVE_STAGE }}
+          SERVE_IMAGE: ${{ env.SERVE_IMAGE }}
         run: |
           set -euo pipefail
-          NS="${NAMESPACE}"
-          DEPLOY="${SERVE_DEPLOY}"
 
-          kubectl -n "${NS}" patch deploy "${DEPLOY}" -p "{
-            \"spec\": {
-              \"template\": {
-                \"spec\": {
-                  \"containers\": [
-                    {
-                      \"name\": \"server\",
-                      \"image\": \"${SERVE_IMAGE}\"
-                    }
-                  ]
-                }
-              }
-            }
-          }"
+          # mlflow serve 커맨드 만들기
+          SERVE_CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
 
-          echo "Patched image to ${SERVE_IMAGE}"
+          echo "[info] SERVE_CMD=${SERVE_CMD}"
+          echo "[info] SERVE_IMAGE=${SERVE_IMAGE}"
 
-      # 5) Force a new ReplicaSet every run (annotation bump),
-      #    so old RS with old template won't keep a zombie pod.
-      - name: Force template bump
-        run: |
-          set -e
-          NS="${NAMESPACE}"
-          DEPLOY="${SERVE_DEPLOY}"
+          # json escape를 위해서 jq를 쓰면 제일 안전하지만,
+          # runner에 jq 없을 수도 있으니 apt-get or pip install 등으로 추가해도 됨.
+          # 여기서는 sh/qouted 문자열로 patch (공백/따옴표 주의).
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+            {\"op\":\"replace\",\"path\":\"/spec/replicas\",\"value\":1},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",\"value\":[\"sh\",\"-c\"]},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/args\",\"value\":[\"${SERVE_CMD}\"]},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/ports\",\"value\":[{\"containerPort\": ${SERVE_PORT}, \"name\": \"http\"}]},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/resources\",\"value\":{
+              \"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},
+              \"limits\":   {\"cpu\": \"1\",    \"memory\": \"1Gi\"}
+            }},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",\"value\":{
+              \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+              \"initialDelaySeconds\": 30,
+              \"periodSeconds\": 5,
+              \"timeoutSeconds\": 3,
+              \"failureThreshold\": 120,
+              \"successThreshold\": 1
+            }},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",\"value\":{
+              \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+              \"periodSeconds\": 5,
+              \"timeoutSeconds\": 2,
+              \"failureThreshold\": 6,
+              \"successThreshold\": 1
+            }},
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",\"value\":{
+              \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+              \"initialDelaySeconds\": 60,
+              \"periodSeconds\": 10,
+              \"timeoutSeconds\": 2,
+              \"failureThreshold\": 3,
+              \"successThreshold\": 1
+            }}
+          ]"
+
+          # 이미지 교체는 SERVE_IMAGE 있을 때만 (만약 비어 있으면 기존 이미지 유지)
+          if [ -n "${SERVE_IMAGE}" ]; then
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+              {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",\"value\":\"${SERVE_IMAGE}\"}
+            ]"
+          else
+            echo "::warning ::SERVE_IMAGE was empty, keeping previous image"
+          fi
+
+          # rollout 주기를 강제로 새로 만들도록 annotation bump
           TS=$(date +%s)
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+            {\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",\"value\":\"${TS}\"}
+          ]"
 
-          kubectl -n "${NS}" patch deploy "${DEPLOY}" -p "{
-            \"spec\": {
-              \"template\": {
-                \"metadata\": {
-                  \"annotations\": {
-                    \"workflows/restartedAt\": \"${TS}\",
-                    \"workflows/run-id\": \"${{ github.run_id }}\"
-                  }
-                }
-              }
-            }
-          }"
-
-          echo "=== Deployment after bump ==="
-          kubectl -n "${NS}" get deploy "${DEPLOY}" -o wide
-
-      # 6) Rollout & status dump
-      - name: Rollout restart serve
-        if: ${{ inputs.reload_method == 'rollout' || env.SERVE_IMAGE != '' }}
+      # 5) rollout & status
+      - name: Rollout restart / status
+        env:
+          NAMESPACE: ${{ env.NAMESPACE }}
+          SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
         run: |
-          set -e
-          NS="${NAMESPACE}"
-          DEPLOY="${SERVE_DEPLOY}"
-
-          kubectl -n "${NS}" rollout restart deploy/${DEPLOY} || true
-
-          echo "=== Deployment ==="
-          kubectl -n "${NS}" get deploy ${DEPLOY} -o wide
-
-          echo "=== ReplicaSets ==="
-          kubectl -n "${NS}" get rs -l app=${DEPLOY} -o wide || true
-
-          echo "=== Pods (before wait) ==="
-          kubectl -n "${NS}" get pods -l app=${DEPLOY} -o wide || true
-
-          kubectl -n "${NS}" rollout status deploy/${DEPLOY} --timeout=600s || true
-
-          echo "=== Pods (after wait) ==="
-          kubectl -n "${NS}" get pods -l app=${DEPLOY} -o wide || true
-
-      # 7) Optional HTTP hot-reload hook (if your serve container exposes /reload)
-      - name: Call /reload on light-serve (HTTP) [optional]
-        if: ${{ inputs.reload_method == 'http' }}
-        run: |
-          curl -s -X POST http://${{ env.SERVE_DEPLOY }}.${{ env.NAMESPACE }}.svc.cluster.local:${{ env.SERVE_PORT }}/reload || true
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" rollout restart deploy/${SERVE_DEPLOY}
+          kubectl -n "${NAMESPACE}" rollout status deploy/${SERVE_DEPLOY} --timeout=300s
 
