@@ -1,4 +1,4 @@
-# ml/train.py
+# ml/train.py (heavy MLP version)
 import os, time, json
 import numpy as np
 import matplotlib
@@ -11,19 +11,19 @@ import mlflow as mlmod
 from mlflow.tracking import MlflowClient
 from mlflow.exceptions import RestException
 from mlflow.models import infer_signature
-from sklearn.base import clone
 
+from sklearn.base import clone
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, log_loss
-from sklearn.linear_model import SGDClassifier
+from sklearn.neural_network import MLPClassifier
 from pathlib import Path
 
 # ===== 파라미터 / 설정 =====
 EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
-# 기본 러닝타임 타깃(초) — 대략 5분
+# 기본 러닝타임 타깃(초) — 대략 5분 (요청사항 유지)
 TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "300"))
 
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
@@ -36,15 +36,16 @@ AUGMENT_ENABLE  = os.getenv("AUGMENT_ENABLE", "1") == "1"
 AUGMENT_COPIES  = int(os.getenv("AUGMENT_COPIES", "3"))
 AUGMENT_NOISE   = float(os.getenv("AUGMENT_NOISE", "0.08"))
 
-# 🔸 burn(추가 연산)
+# 🔸 burn(추가 연산) - 학습 외의 순수 연산으로 시간을 더 쓰는 부분
 DEFAULT_BURN_PASSES = "1200"
 BURN_PASSES     = int(os.getenv("BURN_PASSES", DEFAULT_BURN_PASSES))
 BURN_NOISE      = float(os.getenv("BURN_NOISE", "0.08"))
 BURN_ENABLE     = os.getenv("BURN_ENABLE", "1") == "1"
 BURN_CHUNK_PASSES = int(os.getenv("BURN_CHUNK_PASSES", "256"))
 
-# SGD 하이퍼파라미터
-LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))
+# MLP 하이퍼파라미터 (무겁게 만들 포인트)
+HIDDEN_WIDTH    = int(os.getenv("MLP_HIDDEN_WIDTH", "256"))
+HIDDEN_LAYERS   = int(os.getenv("MLP_HIDDEN_LAYERS", "3"))
 LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))
 RANDOM_STATE    = int(os.getenv("SEED", "42"))
 EMA_ALPHA       = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
@@ -124,16 +125,26 @@ def batch_iter(X, y, batch_size, shuffle=True, seed=None):
         yield X[b], y[b]
 
 def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
-    """추가 학습(로그 반영 X, 연산량만 증가)."""
+    """
+    추가 학습/연산 (로그 반영 X, pure compute).
+    여기서는 template_clf와 비슷한 MLP를 복제해서
+    랜덤 노이즈 배치로 partial_fit을 여러 번 돌려줌.
+    """
     if passes <= 0:
         return
     rng = np.random.default_rng(seed)
     shadow = clone(template_clf)
-    uclasses = np.unique(y)
+    classes = np.unique(y)
+
+    # 초기 partial_fit (classes 세팅)
     if len(X) >= batch_size:
-        shadow.partial_fit(X[:batch_size], y[:batch_size], classes=uclasses)
+        xb = X[:batch_size]
+        yb = y[:batch_size]
     else:
-        shadow.partial_fit(X, y, classes=uclasses)
+        xb = X
+        yb = y
+    shadow.partial_fit(xb, yb, classes=classes)
+
     n = len(X)
     for _ in range(passes):
         idx = rng.integers(0, n, size=min(batch_size, n))
@@ -141,7 +152,9 @@ def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
         shadow.partial_fit(Xb, y[idx])
 
 def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_deadline_sec):
-    """목표 벽시계 시간에 맞추기 위한 burn 반복."""
+    """
+    목표 벽시계 시간까지 남은 시간을 태우기 위한 burn 루프.
+    """
     if not BURN_ENABLE:
         return
     start = time.perf_counter()
@@ -157,20 +170,20 @@ def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_dea
         )
         rng_seed += 1
 
-# === NEW: GHCR 메타데이터를 MLflow 태그/아티팩트로 남기는 헬퍼 ===
+# === GHCR 메타데이터를 MLflow 태그/아티팩트로 남기는 헬퍼 (그대로 유지)
 def log_ghcr_metadata_to_mlflow():
     """
     GHCR 관련 ENV를 읽어 MLflow 태그로 저장.
-    또한 (선택) 동일 내용을 build/image.json으로 기록해 아티팩트 업로드.
+    또한 동일 내용을 build/image.json으로 기록해 아티팩트 업로드.
     """
-    ghcr_image   = os.getenv("GHCR_IMAGE", "")        # ghcr.io/<owner>/<repo>
-    ghcr_tag     = os.getenv("GHCR_TAG", "")          # runtime-<BUILD_KEY or SHA>
-    ghcr_digest  = os.getenv("GHCR_DIGEST", "")       # sha256:...
-    ghcr_ref     = os.getenv("GHCR_IMAGE_REF", "")    # ghcr.io/...@sha256:...
+    ghcr_image   = os.getenv("GHCR_IMAGE", "")
+    ghcr_tag     = os.getenv("GHCR_TAG", "")
+    ghcr_digest  = os.getenv("GHCR_DIGEST", "")
+    ghcr_ref     = os.getenv("GHCR_IMAGE_REF", "")
     run_id_ci    = os.getenv("GITHUB_RUN_ID", "")
     git_sha      = os.getenv("GIT_SHA", "")
 
-    # 태그로 기록 (UI/검색용)
+    # 태그 기록 (UI/검색용)
     mlmod.set_tag("ci.run_id", run_id_ci)
     mlmod.set_tag("git.sha",   git_sha)
     mlmod.set_tag("ghcr.image",  ghcr_image)
@@ -178,7 +191,7 @@ def log_ghcr_metadata_to_mlflow():
     mlmod.set_tag("ghcr.digest", ghcr_digest)
     mlmod.set_tag("ghcr.ref",    ghcr_ref)
 
-    # (선택) 아티팩트 JSON도 남김 → MinIO에서 바로 파싱 가능
+    # 아티팩트 JSON도 남김
     try:
         meta = {
             "image": ghcr_image,
@@ -193,23 +206,24 @@ def log_ghcr_metadata_to_mlflow():
             json.dump(meta, f, indent=2)
         mlmod.log_artifact("build/image.json", artifact_path="build")
     except Exception:
-        # 아티팩트 기록 실패해도 학습은 계속
         pass
 
 def main():
     wall_start = time.perf_counter()
 
+    # MLflow 세팅
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or os.getenv("TRACKING_URI") or mlmod.get_tracking_uri()
     mlmod.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
     exp_id = ensure_experiment_id(EXP_NAME, client)
 
+    # 데이터 로딩
     iris = load_iris()
     X_train, X_test, y_train, y_test = train_test_split(
         iris.data, iris.target, test_size=0.30, random_state=0
     )
 
-    # ==== 데이터 증강 ====
+    # ==== 데이터 증강 (원래 로직 유지) ====
     if AUGMENT_ENABLE and AUGMENT_COPIES > 0:
         rng = np.random.default_rng(RANDOM_STATE + 777)
         X_aug_list = [X_train]; y_aug_list = [y_train]
@@ -222,15 +236,39 @@ def main():
 
     classes = np.unique(y_train)
 
+    # ===== MLP 모델 구성 (더 무겁게) =====
+    # hidden_layer_sizes = (HIDDEN_WIDTH, HIDDEN_WIDTH, ..., HIDDEN_WIDTH)
+    hidden_layers = tuple([HIDDEN_WIDTH] * HIDDEN_LAYERS)
+
+    # warm_start=True 하면 partial_fit처럼 누적학습 느낌을 줄 수는 없지만,
+    # 우리는 아래에서 직접 partial_fit을 쓸 거라, solver='sgd'로 작은 step씩 돌려서
+    # 반복 연산량을 늘린다.
+    base_clf = MLPClassifier(
+        hidden_layer_sizes=hidden_layers,
+        activation="relu",
+        solver="sgd",
+        learning_rate_init=LR_INITIAL,
+        momentum=0.9,
+        n_iter_no_change=200,      # 우리는 끊어서 partial_fit 비슷하게 때림 → early stop 안 걸리게 크게
+        max_iter=1,                # 한 번에 한 스텝만 돌리게
+        random_state=RANDOM_STATE,
+        warm_start=False,
+        tol=None,
+        alpha=0.0001,
+        shuffle=False,
+        verbose=False
+    )
+
     with start_run_with_retry(exp_id, RUN_NAME) as run:
         run_id = run.info.run_id
         print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
 
-        # === NEW: GHCR 메타데이터를 RUN 시작 직후 기록 ===
+        # GHCR 메타데이터 기록 (유지)
         log_ghcr_metadata_to_mlflow()
 
+        # MLflow 파라미터 기록 (형식 유지하되 모델 설명만 바꿈)
         mlmod.log_params({
-            "model": "SGDClassifier(logistic)",
+            "model": f"MLPClassifier(hidden_layers={hidden_layers}, sgd)",
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "sleep_sec": SLEEP_SEC,
@@ -243,36 +281,33 @@ def main():
             "burn_chunk_passes": BURN_CHUNK_PASSES
         })
 
-        clf = SGDClassifier(
-            loss="log_loss",
-            penalty="l2",
-            alpha=LR_ALPHA,
-            learning_rate="optimal",
-            random_state=RANDOM_STATE,
-            fit_intercept=True,
-            max_iter=1,
-            warm_start=False,
-            tol=None
-        )
-
-        # 초기 partial_fit (classes 세팅)
-        clf.partial_fit(X_train[:BATCH_SIZE], y_train[:BATCH_SIZE], classes=classes)
+        # MLPClassifier는 partial_fit을 지원하지만,
+        # multi_class 문제에서 classes 인자를 첫 호출에 넣어줘야 안정적으로 동작.
+        clf = clone(base_clf)
+        # 첫 partial_fit으로 클래스 스펙 고정
+        init_batch_X = X_train[:min(BATCH_SIZE, len(X_train))]
+        init_batch_y = y_train[:min(BATCH_SIZE, len(y_train))]
+        clf.partial_fit(init_batch_X, init_batch_y, classes=classes)
 
         f1_hist = []
-        ema = None
+        ema = None  # epoch compute time 지수평활
 
         for epoch in range(1, EPOCHS + 1):
             t_epoch = time.perf_counter()
 
-            # 본 학습
+            # 본 학습 루프: 여러 loop/batch로 partial_fit 반복
             for loop in range(LOOPS_PER_EPOCH):
                 for Xb, yb in batch_iter(
-                    X_train, y_train, BATCH_SIZE, shuffle=True,
+                    X_train, y_train,
+                    BATCH_SIZE,
+                    shuffle=True,
                     seed=RANDOM_STATE + epoch * 1000 + loop
                 ):
+                    # 여러 번 partial_fit 돌리면 MLP가 점진적으로 업데이트되면서
+                    # CPU/GPU 시간을 점점 더 태움 → 무거운 학습 효과.
                     clf.partial_fit(Xb, yb)
 
-            # 고정 burn
+            # burn 단계: 추가 연산량
             if BURN_ENABLE and BURN_PASSES > 0:
                 extra_training_burn(
                     template_clf=clf,
@@ -285,7 +320,7 @@ def main():
 
             compute_sec = time.perf_counter() - t_epoch
 
-            # 평가/로그
+            # === 평가/로그 (형식 동일) ===
             y_pred = clf.predict(X_test)
             acc = float(accuracy_score(y_test, y_pred))
             f1  = float(f1_score(y_test, y_pred, average="macro"))
@@ -295,6 +330,7 @@ def main():
             except Exception:
                 ll = float("nan")
 
+            # ETA 추정용 EMA
             if ema is None:
                 ema = compute_sec
             else:
@@ -303,6 +339,7 @@ def main():
             elapsed = time.perf_counter() - wall_start
             eta_sec = max(0.0, TARGET_WALL_SEC - elapsed)
 
+            # MLflow metrics 로그 (키 이름 그대로 유지)
             mlmod.log_metrics({
                 "accuracy": acc,
                 "f1_score": f1,
@@ -316,8 +353,12 @@ def main():
             }, step=epoch)
 
             f1_hist.append(f1)
-            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
-                  f"sleep={SLEEP_SEC:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
+
+            # stdout JSON 로그도 기존 포맷 유지 (Promtail/Loki 소비 포맷)
+            print(
+                f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
+                f"sleep={SLEEP_SEC:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s"
+            )
             log_json_line({
                 "event": "epoch_metric",
                 "epoch": epoch,
@@ -328,10 +369,11 @@ def main():
                 "experiment": EXP_NAME,
             })
 
+            # epoch 끝에서 sleep (원래 로직 유지 가능)
             if SLEEP_SEC > 0:
                 time.sleep(SLEEP_SEC)
 
-            # 타임 타깃 보정
+            # 추가 시간 채우기: 목표 벽시간에 맞추기
             remaining_to_target = TARGET_WALL_SEC - (time.perf_counter() - wall_start)
             if BURN_ENABLE and remaining_to_target > 5.0:
                 per_epoch_cap = float(os.getenv("PER_EPOCH_SPEND_CAP_SEC", "60"))
@@ -346,11 +388,12 @@ def main():
                         target_deadline_sec=to_spend
                     )
 
+            # 전체 타깃 시간(기본 300초) 채웠으면 조기 종료 (원래 로직 유지)
             if time.perf_counter() - wall_start >= TARGET_WALL_SEC:
                 print(f"[info] target wall time ({TARGET_WALL_SEC:.0f}s) reached. stopping early.")
                 break
 
-        # 총 학습 시간(더미 키 유지용)
+        # 총 학습 시간 기록 (원래 메트릭 키 유지)
         total_time = time.perf_counter() - wall_start
         mlmod.log_metric("train_time_total_sec", total_time)
 
@@ -377,6 +420,7 @@ def main():
         plt.savefig("learning_curve_f1.png", bbox_inches="tight")
         mlmod.log_artifact("learning_curve_f1.png", artifact_path="plots")
 
+        # 모델 저장: sklearn 모델로서 log_model (= 바깥 promote 파이프라인 그대로 쓸 수 있게 유지)
         from mlflow import sklearn as ml_sklearn
         signature = infer_signature(X_train, clf.predict(X_train))
         ml_sklearn.log_model(
@@ -386,11 +430,12 @@ def main():
             input_example=X_train[:2]
         )
 
+        # 예제 인풋도 그대로 남김
         with open("input_example.json", "w") as f:
             json.dump(X_test[:2].tolist(), f)
         mlmod.log_artifact("input_example.json")
 
-        # ── 최종 JSON 한 줄 (마지막 포인트로 쓰기 좋음)
+        # 마지막 JSON 로그도 기존 포맷 그대로 유지
         final_acc = float(f1_hist[-1]) if f1_hist else float("nan")
         log_json_line({
             "event": "train_done",
