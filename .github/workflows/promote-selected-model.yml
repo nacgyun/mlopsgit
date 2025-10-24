@@ -11,7 +11,7 @@ on:
         description: "RUN_ID to promote (copy from MLflow UI)"
         required: true
       serve_stage:
-        description: "MLflow stage to serve (ex: Production)"
+        description: "MLflow stage to serve (e.g. Production)"
         required: true
         default: "Production"
 
@@ -33,10 +33,10 @@ jobs:
       SERVE_STAGE: ${{ inputs.serve_stage }}
 
     steps:
-      # ---- 0. repo checkout (need promote.py) ----
+      # 0. checkout (need promote.py)
       - uses: actions/checkout@v4
 
-      # ---- 1. Python runtime for mlflow, kubernetes client, etc. ----
+      # 1. python runtime + libs
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -51,13 +51,13 @@ jobs:
             pyyaml \
             jq
 
-      # ---- 2. kubectl binary ----
+      # 2. kubectl
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: 'v1.30.0'
 
-      # ---- 3. in-cluster kubeconfig (runner is in cluster w/ SA token) ----
+      # 3. in-cluster kubeconfig (runner pod SA token)
       - name: Build in-cluster kubeconfig
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -81,11 +81,10 @@ jobs:
 
           kubectl config use-context in-cluster
 
-      # ---- 4. Promote the given RUN_ID into the requested stage in MLflow Registry ----
-      # promote.py is assumed to:
-      #   - take env RUN_ID, MODEL_NAME, SERVE_STAGE, etc.
-      #   - register that run's artifacts as a model version
-      #   - transition that version to SERVE_STAGE (e.g. Production)
+      # 4. Promote given RUN_ID -> SERVE_STAGE in MLflow Registry
+      #    promote.py should:
+      #      - register runs:/<RUN_ID>/model into MODEL_NAME
+      #      - transition that version to SERVE_STAGE (Production, etc.)
       - name: Promote in MLflow (runs:/<RUN_ID>/model -> $SERVE_STAGE)
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
@@ -96,14 +95,19 @@ jobs:
           set -euo pipefail
           python promote.py
 
-      # ---- 5. Resolve GHCR runtime image for this RUN_ID from MLflow run tags ----
-      # train.py was modified to log tags like:
-      #   ghcr.ref       (full ref like ghcr.io/...:runtime-<hash> OR ghcr.io/...@sha256:...)
-      #   ghcr.image     (ghcr.io/nacgyun/mlopsgit:runtime)
-      #   ghcr.digest    (sha256:....)
-      #   ghcr.tag       (runtime-<sha>...)
+      # 5. Resolve GHCR runtime image reference from MLflow run tags
       #
-      # We use best available to build SERVE_IMAGE. This gets exported to GITHUB_ENV
+      # train.py writes tags:
+      #   ghcr.ref        (preferred, may be full ref like ghcr.io/...:runtime-<hash> or @sha256:...)
+      #   ghcr.image
+      #   ghcr.digest
+      #   ghcr.tag
+      #
+      # Priority:
+      #   1) ghcr.ref
+      #   2) ghcr.image@ghcr.digest
+      #   3) ghcr.image:ghcr.tag
+      # If none -> SERVE_IMAGE=""
       - name: Resolve GHCR image from RUN tags
         id: resolve_image
         env:
@@ -154,8 +158,8 @@ jobs:
             echo "::warning ::Failed to resolve SERVE_IMAGE from MLflow run tags. Will keep current Deployment image."
           fi
 
-      # ---- 6. Make sure light-serve Deployment has MinIO/MLflow env ----
-      # This guarantees the container knows how to talk to MLflow tracking server and MinIO.
+      # 6. Ensure MLflow + MinIO env vars exist on deployment
+      #    (keeps S3-style access working for mlflow models serve)
       - name: Ensure MLflow/MinIO env on Deployment
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -170,17 +174,19 @@ jobs:
             AWS_S3_FORCE_PATH_STYLE=true \
             || true
           # NOTE: We assume AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are already
-          #       present via secretRef in the Deployment, so we don't re-add here.
+          #       injected via secretRef in the Deployment spec.
 
-      # ---- 7. Patch Deployment spec with:
-      #        - correct image (if SERVE_IMAGE resolved)
-      #        - correct command/args pointing to models:/<MODEL_NAME>/<SERVE_STAGE>
-      #        - consistent probes, resources, ports
-      #        - workflows/restartedAt timestamp annotation to FORCE new ReplicaSet
+      # 7. Patch Deployment:
+      #    - container command/args -> mlflow models serve -m models:/MODEL_NAME/SERVE_STAGE ...
+      #    - port/probes/resources -> stable values we trust
+      #    - replicas -> 1
+      #    - image -> SERVE_IMAGE (if resolved)
+      #    - bump annotation workflows/restartedAt (using replace, not add)
       #
-      # This guarantees that EVEN IF you deploy the same RUN_ID twice,
-      # the annotation timestamp changes -> spec.template changes -> new RS -> new Pod.
-      - name: Patch light-serve Deployment for new RUN (image + serve cmd + rollout bump)
+      # This guarantees:
+      #   * even same RUN_ID triggers new ReplicaSet (annotation timestamp changes)
+      #   * pod starts with correct runtime image built during training
+      - name: Patch light-serve Deployment for new RUN
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
@@ -192,13 +198,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # build runtime serve command, e.g.:
-          # mlflow models serve -m models:/light-logreg/Production --host 0.0.0.0 --port 8000 --env-manager local
           CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
-          echo "[info] using CMD=${CMD}"
+          echo "[info] serve CMD=${CMD}"
           echo "[info] SERVE_IMAGE=${SERVE_IMAGE}"
 
-          # 7a. Patch core container config (command/args/ports/resources/probes)
+          # 7a. Core container shape (cmd/args/ports/resources/probes/replicas=1)
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/replicas\",\"value\":1},
 
@@ -247,24 +251,26 @@ jobs:
              }}
           ]"
 
-          # 7b. Patch image if we resolved it from tags. If we couldn't, keep old image.
+          # 7b. Only patch image if we actually resolved SERVE_IMAGE
           if [ -n "${SERVE_IMAGE}" ]; then
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
               {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",
                \"value\":\"${SERVE_IMAGE}\"}
             ]"
           else
-            echo "::warning ::SERVE_IMAGE empty -> keeping previous container image"
+            echo "::warning ::SERVE_IMAGE empty -> keeping existing container image"
           fi
 
-          # 7c. Force rollout by bumping an annotation with a fresh timestamp.
+          # 7c. FORCE rollout every run:
+          #     bump annotation with fresh timestamp using 'replace'
           TS=$(date +%s)
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-            {\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
+            {\"op\":\"replace\",
+             \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
              \"value\":\"${TS}\"}
           ]"
 
-      # ---- 8. Wait for rollout to become Ready (new pod should spin up) ----
+      # 8. Wait for rollout to become Ready (new pod should spin up)
       - name: Rollout status
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
