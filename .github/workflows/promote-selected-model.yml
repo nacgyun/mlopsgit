@@ -11,7 +11,7 @@ on:
         description: "RUN_ID to promote (copy from MLflow UI)"
         required: true
       serve_stage:
-        description: "MLflow stage to serve"
+        description: "MLflow stage to serve (ex: Production)"
         required: true
         default: "Production"
 
@@ -33,8 +33,10 @@ jobs:
       SERVE_STAGE: ${{ inputs.serve_stage }}
 
     steps:
+      # ---- 0. repo checkout (need promote.py) ----
       - uses: actions/checkout@v4
 
+      # ---- 1. Python runtime for mlflow, kubernetes client, etc. ----
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -42,14 +44,23 @@ jobs:
 
       - name: Install deps (runner side)
         run: |
-          pip install --no-cache-dir mlflow-skinny boto3 kubernetes pyyaml jq
+          pip install --no-cache-dir \
+            mlflow-skinny \
+            boto3 \
+            kubernetes \
+            pyyaml \
+            jq
 
-      - name: Setup kubectl (client binary)
+      # ---- 2. kubectl binary ----
+      - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: 'v1.30.0'
 
+      # ---- 3. in-cluster kubeconfig (runner is in cluster w/ SA token) ----
       - name: Build in-cluster kubeconfig
+        env:
+          NAMESPACE: ${{ env.NAMESPACE }}
         run: |
           set -e
           CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
@@ -66,11 +77,15 @@ jobs:
           kubectl config set-context in-cluster \
             --cluster=in-cluster \
             --user=sa \
-            --namespace=${NAMESPACE}
+            --namespace="${NAMESPACE}"
 
           kubectl config use-context in-cluster
 
-      # 1) RUN_ID를 Model Registry에서 $SERVE_STAGE(=Production)로 승격
+      # ---- 4. Promote the given RUN_ID into the requested stage in MLflow Registry ----
+      # promote.py is assumed to:
+      #   - take env RUN_ID, MODEL_NAME, SERVE_STAGE, etc.
+      #   - register that run's artifacts as a model version
+      #   - transition that version to SERVE_STAGE (e.g. Production)
       - name: Promote in MLflow (runs:/<RUN_ID>/model -> $SERVE_STAGE)
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
@@ -81,7 +96,14 @@ jobs:
           set -euo pipefail
           python promote.py
 
-      # 2) MLflow run 태그에서 GHCR 이미지 가져오기 -> SERVE_IMAGE export
+      # ---- 5. Resolve GHCR runtime image for this RUN_ID from MLflow run tags ----
+      # train.py was modified to log tags like:
+      #   ghcr.ref       (full ref like ghcr.io/...:runtime-<hash> OR ghcr.io/...@sha256:...)
+      #   ghcr.image     (ghcr.io/nacgyun/mlopsgit:runtime)
+      #   ghcr.digest    (sha256:....)
+      #   ghcr.tag       (runtime-<sha>...)
+      #
+      # We use best available to build SERVE_IMAGE. This gets exported to GITHUB_ENV
       - name: Resolve GHCR image from RUN tags
         id: resolve_image
         env:
@@ -127,13 +149,14 @@ jobs:
               f.write(f"SERVE_IMAGE_REASON={reason}\n")
           PYCODE
 
-          echo "SERVE_IMAGE=$SERVE_IMAGE"
+          echo "Resolved SERVE_IMAGE=$SERVE_IMAGE (reason=$SERVE_IMAGE_REASON)"
           if [ -z "$SERVE_IMAGE" ]; then
-            echo "::warning ::Failed to resolve SERVE_IMAGE from MLflow run tags. Will keep current Deployment \`image\`."
+            echo "::warning ::Failed to resolve SERVE_IMAGE from MLflow run tags. Will keep current Deployment image."
           fi
 
-      # 3) 최소한 serve Deployment에 MinIO/MLflow 관련 env는 보장
-      - name: Ensure S3/env on Deployment
+      # ---- 6. Make sure light-serve Deployment has MinIO/MLflow env ----
+      # This guarantees the container knows how to talk to MLflow tracking server and MinIO.
+      - name: Ensure MLflow/MinIO env on Deployment
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
@@ -146,14 +169,18 @@ jobs:
             AWS_DEFAULT_REGION=us-east-1 \
             AWS_S3_FORCE_PATH_STYLE=true \
             || true
-          # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY는 이미 secretRef로 붙어있다고 가정
+          # NOTE: We assume AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are already
+          #       present via secretRef in the Deployment, so we don't re-add here.
 
-      # 4) Deployment spec을 새 RUN_ID 기준으로 패치
-      #    - image (만약 SERVE_IMAGE 있으면)
-      #    - command/args (항상 SERVE_STAGE 반영)
-      #    - probes / resources / port
-      #    - annotation timestamp -> 새 ReplicaSet 강제
-      - name: Patch light-serve Deployment for new RUN
+      # ---- 7. Patch Deployment spec with:
+      #        - correct image (if SERVE_IMAGE resolved)
+      #        - correct command/args pointing to models:/<MODEL_NAME>/<SERVE_STAGE>
+      #        - consistent probes, resources, ports
+      #        - workflows/restartedAt timestamp annotation to FORCE new ReplicaSet
+      #
+      # This guarantees that EVEN IF you deploy the same RUN_ID twice,
+      # the annotation timestamp changes -> spec.template changes -> new RS -> new Pod.
+      - name: Patch light-serve Deployment for new RUN (image + serve cmd + rollout bump)
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
@@ -165,68 +192,84 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 새 inference 커맨드 (Production 등 stage 반영)
-          SERVE_CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
-          echo "[info] SERVE_CMD=${SERVE_CMD}"
+          # build runtime serve command, e.g.:
+          # mlflow models serve -m models:/light-logreg/Production --host 0.0.0.0 --port 8000 --env-manager local
+          CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
+          echo "[info] using CMD=${CMD}"
           echo "[info] SERVE_IMAGE=${SERVE_IMAGE}"
 
-          # 공통 스펙(명령/프로브/리소스/포트)을 컨테이너에 주입
+          # 7a. Patch core container config (command/args/ports/resources/probes)
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/replicas\",\"value\":1},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",\"value\":[\"sh\",\"-c\"]},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/args\",\"value\":[\"${SERVE_CMD}\"]},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/ports\",\"value\":[{\"containerPort\": ${SERVE_PORT}, \"name\": \"http\"}]},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/resources\",\"value\":{
-              \"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},
-              \"limits\":   {\"cpu\": \"1\",    \"memory\": \"1Gi\"}
-            }},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",\"value\":{
-              \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-              \"initialDelaySeconds\": 30,
-              \"periodSeconds\": 5,
-              \"timeoutSeconds\": 3,
-              \"failureThreshold\": 120,
-              \"successThreshold\": 1
-            }},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",\"value\":{
-              \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-              \"periodSeconds\": 5,
-              \"timeoutSeconds\": 2,
-              \"failureThreshold\": 6,
-              \"successThreshold\": 1
-            }},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",\"value\":{
-              \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-              \"initialDelaySeconds\": 60,
-              \"periodSeconds\": 10,
-              \"timeoutSeconds\": 2,
-              \"failureThreshold\": 3,
-              \"successThreshold\": 1
-            }}
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",
+             \"value\":[\"sh\",\"-c\"]},
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/args\",
+             \"value\":[\"${CMD}\"]},
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/ports\",
+             \"value\":[{\"containerPort\": ${SERVE_PORT}, \"name\": \"http\"}]},
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/resources\",
+             \"value\":{
+               \"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},
+               \"limits\":   {\"cpu\": \"1\",    \"memory\": \"1Gi\"}
+             }},
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",
+             \"value\":{
+               \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+               \"initialDelaySeconds\": 30,
+               \"periodSeconds\": 5,
+               \"timeoutSeconds\": 3,
+               \"failureThreshold\": 120,
+               \"successThreshold\": 1
+             }},
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",
+             \"value\":{
+               \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+               \"periodSeconds\": 5,
+               \"timeoutSeconds\": 2,
+               \"failureThreshold\": 6,
+               \"successThreshold\": 1
+             }},
+
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",
+             \"value\":{
+               \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+               \"initialDelaySeconds\": 60,
+               \"periodSeconds\": 10,
+               \"timeoutSeconds\": 2,
+               \"failureThreshold\": 3,
+               \"successThreshold\": 1
+             }}
           ]"
 
-          # 이미지도 업데이트 (serve_image 가 비어있지 않을 때)
+          # 7b. Patch image if we resolved it from tags. If we couldn't, keep old image.
           if [ -n "${SERVE_IMAGE}" ]; then
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-              {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",\"value\":\"${SERVE_IMAGE}\"}
+              {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",
+               \"value\":\"${SERVE_IMAGE}\"}
             ]"
           else
-            echo "::warning ::SERVE_IMAGE empty -> keeping old container image"
+            echo "::warning ::SERVE_IMAGE empty -> keeping previous container image"
           fi
 
-          # rollout 강제 트리거: annotation에 timestamp 넣기
+          # 7c. Force rollout by bumping an annotation with a fresh timestamp.
           TS=$(date +%s)
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-            {\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",\"value\":\"${TS}\"}
+            {\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
+             \"value\":\"${TS}\"}
           ]"
 
-      # 5) rollout & 대기
+      # ---- 8. Wait for rollout to become Ready (new pod should spin up) ----
       - name: Rollout status
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
         run: |
           set -euo pipefail
-          kubectl -n "${NAMESPACE}" rollout restart deploy/${SERVE_DEPLOY}
           kubectl -n "${NAMESPACE}" rollout status deploy/${SERVE_DEPLOY} --timeout=300s
 
