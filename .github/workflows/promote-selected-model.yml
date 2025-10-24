@@ -34,12 +34,12 @@ jobs:
 
     steps:
       #######################################################################
-      # 0. checkout (just so we have repo for context, not using promote.py anymore)
+      # 0. Checkout repo (promote.py 안 써도 되지만 깃 SHA 등 참고용)
       #######################################################################
       - uses: actions/checkout@v4
 
       #######################################################################
-      # 1. python runtime (we'll talk to MLflow ourselves)
+      # 1. Python on runner (for mlflow client)
       #######################################################################
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -56,7 +56,7 @@ jobs:
             jq
 
       #######################################################################
-      # 2. kubectl in this runner
+      # 2. kubectl on runner
       #######################################################################
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
@@ -64,7 +64,7 @@ jobs:
           version: "v1.30.0"
 
       #######################################################################
-      # 3. in-cluster kubeconfig using this runner's SA token
+      # 3. Build in-cluster kubeconfig from this runner pod's SA token
       #######################################################################
       - name: Build in-cluster kubeconfig
         env:
@@ -90,15 +90,9 @@ jobs:
           kubectl config use-context in-cluster
 
       #######################################################################
-      # 4. Promote RUN_ID into the model registry stage (inline, not promote.py)
-      #
-      # Logic:
-      #   - register runs:/<RUN_ID>/model as a new version of MODEL_NAME (if not already)
-      #   - transition that model version to SERVE_STAGE (Production, etc.)
-      #
-      # We:
-      #   * don't raise if it already exists
-      #   * don't block forever
+      # 4. MLflow 등록 & Stage 전환
+      #    - runs:/<RUN_ID>/model 을 MODEL_NAME에 등록
+      #    - 해당 version을 SERVE_STAGE (ex. Production) 로 promote
       #######################################################################
       - name: Promote MLflow model/version (inline)
         env:
@@ -109,7 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PYCODE'
-          import os, time, mlflow
+          import os, mlflow
           from mlflow.tracking import MlflowClient
           from mlflow.exceptions import MlflowException
 
@@ -121,41 +115,33 @@ jobs:
           mlflow.set_tracking_uri(tracking_uri)
           client = MlflowClient(tracking_uri=tracking_uri)
 
-          # model_uri that we want to register
           model_uri = f"runs:/{run_id}/model"
           print(f"[promote] registering {model_uri} -> {model_name}")
 
           version_num = None
 
-          # try to register new version
           try:
               mv = mlflow.register_model(model_uri=model_uri, name=model_name)
               version_num = mv.version
               print(f"[promote] registered new version={version_num}")
           except MlflowException as e:
-              # Possible it's already registered with same source.
-              # We'll just try to find an existing version pointing to this run_id.
               print(f"[promote] register_model exception: {e}")
               print("[promote] trying to find existing model version for this run_id ...")
               for mv in client.search_model_versions(f"name='{model_name}'"):
-                  # mv has .run_id and .version
                   if mv.run_id == run_id:
                       version_num = mv.version
                       print(f"[promote] found existing version={version_num} for run_id")
                       break
 
           if version_num is None:
-              # last ditch: pick the highest version (best guess)
               all_versions = client.search_model_versions(f"name='{model_name}'")
               if all_versions:
-                  # sort by int(version) descending
                   all_versions.sort(key=lambda m:int(m.version), reverse=True)
                   version_num = all_versions[0].version
                   print(f"[promote] fallback using latest version={version_num}")
               else:
                   raise RuntimeError("No model version could be determined at all")
 
-          # now transition to stage
           print(f"[promote] transition v{version_num} -> stage={stage}")
           try:
               client.transition_model_version_stage(
@@ -171,18 +157,8 @@ jobs:
           PYCODE
 
       #######################################################################
-      # 5. Resolve GHCR image info from MLflow run tags
-      #
-      # train.py logs these run tags:
-      #   ghcr.ref         (preferred, e.g. ghcr.io/...:runtime-<hash> or with @sha256)
-      #   ghcr.image
-      #   ghcr.digest
-      #   ghcr.tag
-      #
-      # priority:
-      #   ghcr.ref
-      #   ghcr.image@ghcr.digest
-      #   ghcr.image:ghcr.tag
+      # 5. MLflow run 태그에서 serve용 이미지 태그 추출
+      #    우선순위: ghcr.ref > (image+digest) > (image:tag)
       #######################################################################
       - name: Resolve runtime image from MLflow run tags
         id: resolve_image
@@ -236,34 +212,38 @@ jobs:
           fi
 
       #######################################################################
-      # 6. Make sure env vars needed for mlflow models serve to pull from MinIO
-      #
-      # We assume the Deployment already has the MinIO creds secret env injected.
+      # 6. Deployment에 env 주입
+      #    - 모델/런/스테이지 정보 + MinIO/MLflow 접속 정보
+      #    - 이 단계 자체도 spec.template.env를 수정하므로 rollout 트리거 재료가 된다.
       #######################################################################
-      - name: Ensure MLflow/MinIO env on Deployment
+      - name: Ensure serve env on Deployment
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+          RUN_ID: ${{ env.RUN_ID }}
+          SERVE_STAGE: ${{ env.SERVE_STAGE }}
+          SERVE_PORT: ${{ env.SERVE_PORT }}
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
         run: |
           set -euo pipefail
           kubectl -n "${NAMESPACE}" set env deploy/${SERVE_DEPLOY} \
-            MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI} \
-            MLFLOW_S3_ENDPOINT_URL=http://minio.${NAMESPACE}.svc.cluster.local:9000 \
-            AWS_DEFAULT_REGION=us-east-1 \
-            AWS_S3_FORCE_PATH_STYLE=true \
+            MODEL_NAME="${MODEL_NAME}" \
+            RUN_ID="${RUN_ID}" \
+            SERVE_STAGE="${SERVE_STAGE}" \
+            SERVE_PORT="${SERVE_PORT}" \
+            MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI}" \
+            MLFLOW_S3_ENDPOINT_URL="http://minio.${NAMESPACE}.svc.cluster.local:9000" \
+            AWS_DEFAULT_REGION="us-east-1" \
+            AWS_S3_FORCE_PATH_STYLE="true" \
             || true
 
       #######################################################################
-      # 7. Force fresh pod:
-      #
-      #    (a) scale the Deployment to 0 (old pod dies)
-      #    (b) patch Deployment template:
-      #        - container command/args -> mlflow models serve with MODEL_NAME & SERVE_STAGE
-      #        - container image -> SERVE_IMAGE (if we resolved one)
-      #        - health probes / resources / port
-      #    (c) bump workflows/restartedAt annotation so PodTemplateHash changes
-      #    (d) scale back up to 1
+      # 7. 강제로 fresh pod 만들기
+      #    (a) scale 0 -> 기존 파드 제거
+      #    (b) command/args/ports/resources/probes/image patch
+      #    (c) template annotation 변경(workflows/restartedAt)
+      #    (d) scale 1 -> 새 ReplicaSet/POD 생성
       #######################################################################
       - name: Reconcile Deployment and restart fresh pod
         env:
@@ -283,23 +263,24 @@ jobs:
           CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
           echo "[reconcile] new CMD: ${CMD}"
 
-          # Patch command/args/ports/resources/probes
+          echo "[reconcile] patch command/args/ports/resources"
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",
              \"value\":[\"sh\",\"-c\"]},
-
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/args\",
              \"value\":[\"${CMD}\"]},
-
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/ports\",
              \"value\":[{\"containerPort\": ${SERVE_PORT}, \"name\": \"http\"}]},
-
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/resources\",
              \"value\":{
                \"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},
                \"limits\":   {\"cpu\": \"1\",    \"memory\": \"1Gi\"}
-             }},
+             }}
+          ]"
 
+          echo "[reconcile] patch startupProbe (replace -> fallback add)"
+          set +e
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",
              \"value\":{
                \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
@@ -308,8 +289,27 @@ jobs:
                \"timeoutSeconds\": 3,
                \"failureThreshold\": 120,
                \"successThreshold\": 1
-             }},
+             }}
+          ]"
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+              {\"op\":\"add\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",
+               \"value\":{
+                 \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+                 \"initialDelaySeconds\": 30,
+                 \"periodSeconds\": 5,
+                 \"timeoutSeconds\": 3,
+                 \"failureThreshold\": 120,
+                 \"successThreshold\": 1
+               }}
+            ]"
+          fi
 
+          echo "[reconcile] patch readinessProbe (replace -> fallback add)"
+          set +e
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",
              \"value\":{
                \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
@@ -317,8 +317,26 @@ jobs:
                \"timeoutSeconds\": 2,
                \"failureThreshold\": 6,
                \"successThreshold\": 1
-             }},
+             }}
+          ]"
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+              {\"op\":\"add\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",
+               \"value\":{
+                 \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+                 \"periodSeconds\": 5,
+                 \"timeoutSeconds\": 2,
+                 \"failureThreshold\": 6,
+                 \"successThreshold\": 1
+               }}
+            ]"
+          fi
 
+          echo "[reconcile] patch livenessProbe (replace -> fallback add)"
+          set +e
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",
              \"value\":{
                \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
@@ -329,10 +347,25 @@ jobs:
                \"successThreshold\": 1
              }}
           ]"
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+              {\"op\":\"add\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",
+               \"value\":{
+                 \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
+                 \"initialDelaySeconds\": 60,
+                 \"periodSeconds\": 10,
+                 \"timeoutSeconds\": 2,
+                 \"failureThreshold\": 3,
+                 \"successThreshold\": 1
+               }}
+            ]"
+          fi
 
-          # Patch image if we have SERVE_IMAGE from MLflow run tags
+          # 이미지도 바꿀 수 있으면 여기서 교체
           if [ -n "${SERVE_IMAGE}" ]; then
-            echo "[reconcile] patching image -> ${SERVE_IMAGE}"
+            echo "[reconcile] patch image -> ${SERVE_IMAGE}"
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
               {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",
                \"value\":\"${SERVE_IMAGE}\"}
@@ -341,7 +374,7 @@ jobs:
             echo "::warning ::no SERVE_IMAGE resolved, keeping existing image"
           fi
 
-          # bump annotation workflows/restartedAt to force new template hash
+          # template annotation bump -> 새로운 PodTemplateHash 유도
           TS=$(date +%s)
           echo "[reconcile] bump workflows/restartedAt=${TS}"
           set +e
@@ -353,7 +386,6 @@ jobs:
           RC=$?
           set -e
           if [ $RC -ne 0 ]; then
-            echo "[reconcile] replace failed, doing add instead"
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
               {\"op\":\"add\",
                \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
@@ -365,7 +397,7 @@ jobs:
           kubectl -n "${NAMESPACE}" scale deploy "${SERVE_DEPLOY}" --replicas=1
 
       #######################################################################
-      # 8. Wait until rollout is healthy
+      # 8. rollout 완료 대기 -> 새 파드 떠 있는지 출력
       #######################################################################
       - name: Wait for rollout
         env:
