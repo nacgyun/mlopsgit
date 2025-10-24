@@ -27,7 +27,7 @@ jobs:
       SERVE_PORT: "8000"
 
       # --- MLflow / registry info ---
-      MLFLOW_TRACKING_URI: http://mlflow.mlops.svc.cluster.local:5000
+      MLFLOW_TRACKING_URI: http://10.100.0.102:32055
       MODEL_NAME: ${{ inputs.model_name }}
       RUN_ID: ${{ inputs.run_id }}
       SERVE_STAGE: ${{ inputs.serve_stage }}
