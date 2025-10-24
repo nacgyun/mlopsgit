@@ -20,13 +20,13 @@ jobs:
     runs-on: self-hosted
 
     env:
-      # K8s
+      # K8s config
       NAMESPACE: mlops
       SERVE_DEPLOY: light-serve
       SERVE_PORT: "8000"
-      SERVE_STAGE: Production        # MODEL_URI = models:/<MODEL_NAME>/<SERVE_STAGE>
+      SERVE_STAGE: Production        # will serve models:/<MODEL_NAME>/<SERVE_STAGE>
 
-      # MLflow
+      # MLflow config
       MLFLOW_TRACKING_URI: http://mlflow.mlops.svc.cluster.local:5000
       MODEL_NAME: ${{ inputs.model_name }}
       RUN_ID: ${{ inputs.run_id }}
@@ -58,12 +58,11 @@ jobs:
           kubectl config set-context in-cluster --cluster=in-cluster --user=sa --namespace=${NAMESPACE}
           kubectl config use-context in-cluster
 
-      # 1) 선택된 RUN을 MLflow Registry에 반영 (promote.py는 기존 것 사용)
+      # 1) Promote the chosen RUN_ID into the registry (ModelVersion stage bump etc.)
       - name: Promote in MLflow (runs:/<RUN_ID>/model)
         run: python promote.py
 
-      # 2) MLflow RUN 태그에서 GHCR 이미지 결정
-      #    우선순위: ghcr.ref -> image@digest -> image:tag
+      # 2) Resolve which GHCR image we should serve for this RUN_ID
       - name: Resolve GHCR image from MLflow RUN tags
         id: resolve_image
         env:
@@ -104,20 +103,24 @@ jobs:
             echo "Using SERVE_IMAGE=${SERVE_IMAGE} (source=${SERVE_IMAGE_REASON})"
           fi
 
-      # 3) Deployment를 한 방에 표준 형태로 재정의 (전략적 머지 패치)
-      #    - replicas=1
-      #    - container name=server 의 command/args 를 mlflow models serve ... 으로 고정
-      #    - /ping 프로브 구성
-      #    - 포트 이름 http 추가
-      #    - 리소스 한도 상향
-      #    - env 주입 (TRACKING_URI, MODEL_URI, MinIO 설정 등)
-      - name: Normalize serve Deployment spec
+      # 3) Normalize Deployment spec in ONE strategic merge patch:
+      #    - replicas=1 (so we don't keep 2 pods from 2 ReplicaSets)
+      #    - container 'server' runs mlflow models serve directly (no pip install, no exit-after-boot)
+      #    - probes hit /ping on named port http
+      #    - requests/limits sane
+      #    - env includes: tracking URI, S3/MinIO, AWS creds from secret
+      #
+      #    NOTE: we inline the actual model URI ("models:/<MODEL_NAME>/<SERVE_STAGE>") directly
+      #    into the serve command string. No "$(MODEL_URI)" indirection, no shell expansion required.
+      - name: Normalize serve Deployment spec (strategic merge patch)
         run: |
           set -euo pipefail
           NS="${NAMESPACE}"
           DEPLOY="${SERVE_DEPLOY}"
           PORT="${SERVE_PORT}"
           MODEL_URI_VALUE="models:/${MODEL_NAME}/${SERVE_STAGE}"
+
+          SERVE_CMD="mlflow models serve -m ${MODEL_URI_VALUE} --host 0.0.0.0 --port ${PORT} --env-manager local"
 
           kubectl -n "${NS}" patch deploy "${DEPLOY}" -p "{
             \"spec\": {
@@ -127,14 +130,9 @@ jobs:
                   \"containers\": [
                     {
                       \"name\": \"server\",
-                      \"command\": [\"mlflow\"],
-                      \"args\": [
-                        \"models\",\"serve\",
-                        \"-m\",\"$(MODEL_URI)\",
-                        \"--host\",\"0.0.0.0\",
-                        \"--port\",\"${PORT}\",
-                        \"--env-manager\",\"local\"
-                      ],
+                      \"image\": \"ghcr.io/mlflow/mlflow:latest\",
+                      \"command\": [\"sh\",\"-c\"],
+                      \"args\": [\"${SERVE_CMD}\"],
                       \"ports\": [
                         {\"containerPort\": ${PORT}, \"name\": \"http\"}
                       ],
@@ -164,10 +162,13 @@ jobs:
                       },
                       \"env\": [
                         {\"name\": \"MLFLOW_TRACKING_URI\",     \"value\": \"http://mlflow.${NS}.svc.cluster.local:5000\"},
-                        {\"name\": \"MODEL_URI\",               \"value\": \"${MODEL_URI_VALUE}\"},
                         {\"name\": \"MLFLOW_S3_ENDPOINT_URL\",  \"value\": \"http://minio.${NS}.svc.cluster.local:9000\"},
                         {\"name\": \"AWS_DEFAULT_REGION\",      \"value\": \"us-east-1\"},
-                        {\"name\": \"AWS_S3_FORCE_PATH_STYLE\", \"value\": \"true\"}
+                        {\"name\": \"AWS_S3_FORCE_PATH_STYLE\", \"value\": \"true\"},
+                        {\"name\": \"AWS_ACCESS_KEY_ID\",
+                         \"valueFrom\": {\"secretKeyRef\": {\"name\": \"minio-creds\", \"key\": \"accessKey\"}}},
+                        {\"name\": \"AWS_SECRET_ACCESS_KEY\",
+                         \"valueFrom\": {\"secretKeyRef\": {\"name\": \"minio-creds\", \"key\": \"secretKey\"}}}
                       ]
                     }
                   ]
@@ -179,7 +180,8 @@ jobs:
           echo "=== Deployment after normalize ==="
           kubectl -n "${NS}" get deploy "${DEPLOY}" -o yaml | sed -n '1,200p'
 
-      # 4) MLflow 태그에서 결정된 GHCR 이미지를 deployment 컨테이너에 적용
+      # 4) If we successfully resolved SERVE_IMAGE from the RUN's MLflow tags,
+      #    override the container image to that (immutable runtime image with all deps)
       - name: Patch serve image (from MLflow RUN tags)
         if: ${{ env.SERVE_IMAGE != '' }}
         run: |
@@ -204,13 +206,15 @@ jobs:
 
           echo "Patched image to ${SERVE_IMAGE}"
 
-      # 5) 새 ReplicaSet 강제 생성 (annotation bump로 pod 교체 보장)
+      # 5) Force a new ReplicaSet every run (annotation bump),
+      #    so old RS with old template won't keep a zombie pod.
       - name: Force template bump
         run: |
           set -e
           NS="${NAMESPACE}"
           DEPLOY="${SERVE_DEPLOY}"
           TS=$(date +%s)
+
           kubectl -n "${NS}" patch deploy "${DEPLOY}" -p "{
             \"spec\": {
               \"template\": {
@@ -223,9 +227,11 @@ jobs:
               }
             }
           }"
+
+          echo "=== Deployment after bump ==="
           kubectl -n "${NS}" get deploy "${DEPLOY}" -o wide
 
-      # 6) rollout 진행 / 상태 덤프
+      # 6) Rollout & status dump
       - name: Rollout restart serve
         if: ${{ inputs.reload_method == 'rollout' || env.SERVE_IMAGE != '' }}
         run: |
@@ -233,7 +239,6 @@ jobs:
           NS="${NAMESPACE}"
           DEPLOY="${SERVE_DEPLOY}"
 
-          # rollout restart 는 실패해도 continue해도 되지만 상태를 계속 보자
           kubectl -n "${NS}" rollout restart deploy/${DEPLOY} || true
 
           echo "=== Deployment ==="
@@ -250,7 +255,7 @@ jobs:
           echo "=== Pods (after wait) ==="
           kubectl -n "${NS}" get pods -l app=${DEPLOY} -o wide || true
 
-      # 7) (옵션) HTTP 핫 리로드가 있는 경우만
+      # 7) Optional HTTP hot-reload hook (if your serve container exposes /reload)
       - name: Call /reload on light-serve (HTTP) [optional]
         if: ${{ inputs.reload_method == 'http' }}
         run: |
