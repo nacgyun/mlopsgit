@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       model_name:
-        description: "MLflow model name (e.g., light-logreg)"
+        description: "MLflow model name (e.g. light-logreg)"
         required: true
         default: "light-logreg"
       run_id:
-        description: "RUN_ID to promote (copy from MLflow UI)"
+        description: "RUN_ID from MLflow UI (the training run you want to promote/deploy)"
         required: true
       serve_stage:
-        description: "MLflow stage to serve (e.g. Production)"
+        description: "Stage to serve (ex. Production)"
         required: true
         default: "Production"
 
@@ -26,21 +26,25 @@ jobs:
       SERVE_CONTAINER_INDEX: "0"
       SERVE_PORT: "8000"
 
-      # --- MLflow / registry ---
+      # --- MLflow / registry info ---
       MLFLOW_TRACKING_URI: http://mlflow.mlops.svc.cluster.local:5000
       MODEL_NAME: ${{ inputs.model_name }}
       RUN_ID: ${{ inputs.run_id }}
       SERVE_STAGE: ${{ inputs.serve_stage }}
 
     steps:
-      # 0. checkout (need promote.py)
+      #######################################################################
+      # 0. checkout (need promote.py in repo)
+      #######################################################################
       - uses: actions/checkout@v4
 
-      # 1. python runtime + libs
+      #######################################################################
+      # 1. python runtime (we'll talk to MLflow)
+      #######################################################################
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps (runner side)
         run: |
@@ -51,13 +55,17 @@ jobs:
             pyyaml \
             jq
 
-      # 2. kubectl
+      #######################################################################
+      # 2. kubectl in this runner
+      #######################################################################
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: 'v1.30.0'
+          version: "v1.30.0"
 
-      # 3. in-cluster kubeconfig (runner pod SA token)
+      #######################################################################
+      # 3. in-cluster kubeconfig using this runner's SA token
+      #######################################################################
       - name: Build in-cluster kubeconfig
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -81,11 +89,13 @@ jobs:
 
           kubectl config use-context in-cluster
 
-      # 4. Promote given RUN_ID -> SERVE_STAGE in MLflow Registry
-      #    promote.py should:
+      #######################################################################
+      # 4. Promote that RUN_ID into the model registry stage.
+      #    promote.py is expected to:
       #      - register runs:/<RUN_ID>/model into MODEL_NAME
       #      - transition that version to SERVE_STAGE (Production, etc.)
-      - name: Promote in MLflow (runs:/<RUN_ID>/model -> $SERVE_STAGE)
+      #######################################################################
+      - name: Promote MLflow model/version
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
           MODEL_NAME: ${{ env.MODEL_NAME }}
@@ -93,22 +103,25 @@ jobs:
           SERVE_STAGE: ${{ env.SERVE_STAGE }}
         run: |
           set -euo pipefail
+          echo "[info] Promoting RUN_ID=${RUN_ID} -> ${MODEL_NAME} stage=${SERVE_STAGE}"
           python promote.py
+          echo "[info] Promote done."
 
-      # 5. Resolve GHCR runtime image reference from MLflow run tags
+      #######################################################################
+      # 5. Read GHCR image info from MLflow run tags
       #
-      # train.py writes tags:
-      #   ghcr.ref        (preferred, may be full ref like ghcr.io/...:runtime-<hash> or @sha256:...)
+      # train.py should be tagging:
+      #   ghcr.ref         (preferred full ref, e.g. ghcr.io/...:runtime-<hash> or with @sha256)
       #   ghcr.image
       #   ghcr.digest
       #   ghcr.tag
       #
-      # Priority:
-      #   1) ghcr.ref
-      #   2) ghcr.image@ghcr.digest
-      #   3) ghcr.image:ghcr.tag
-      # If none -> SERVE_IMAGE=""
-      - name: Resolve GHCR image from RUN tags
+      # priority:
+      #   ghcr.ref
+      #   ghcr.image@ghcr.digest
+      #   ghcr.image:ghcr.tag
+      #######################################################################
+      - name: Resolve runtime image from MLflow run tags
         id: resolve_image
         env:
           MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
@@ -146,20 +159,25 @@ jobs:
               serve_image = ""
               reason = "fallback-none"
 
-          print(f"[resolve_image] RUN_ID={run_id} SERVE_IMAGE={serve_image} source={reason}", file=sys.stderr)
+          print(f"[resolve_image] RUN_ID={run_id}")
+          print(f"[resolve_image] SERVE_IMAGE={serve_image} (from {reason})", file=sys.stderr)
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"SERVE_IMAGE={serve_image}\n")
               f.write(f"SERVE_IMAGE_REASON={reason}\n")
           PYCODE
 
-          echo "Resolved SERVE_IMAGE=$SERVE_IMAGE (reason=$SERVE_IMAGE_REASON)"
-          if [ -z "$SERVE_IMAGE" ]; then
-            echo "::warning ::Failed to resolve SERVE_IMAGE from MLflow run tags. Will keep current Deployment image."
+          echo "[info] SERVE_IMAGE=${SERVE_IMAGE} (reason=${SERVE_IMAGE_REASON})"
+          if [ -z "${SERVE_IMAGE}" ]; then
+            echo "::warning ::Could not resolve SERVE_IMAGE from MLflow tags; will reuse current Deployment image."
           fi
 
-      # 6. Ensure MLflow + MinIO env vars exist on deployment
-      #    (keeps S3-style access working for mlflow models serve)
+      #######################################################################
+      # 6. Make sure env vars needed for mlflow models serve to pull from MinIO
+      #
+      # This only ensures static envs (endpoint, region, path style).
+      # We assume minio creds are already present in Deployment as secretKeyRef.
+      #######################################################################
       - name: Ensure MLflow/MinIO env on Deployment
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -173,20 +191,23 @@ jobs:
             AWS_DEFAULT_REGION=us-east-1 \
             AWS_S3_FORCE_PATH_STYLE=true \
             || true
-          # NOTE: We assume AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are already
-          #       injected via secretRef in the Deployment spec.
 
-      # 7. Patch Deployment:
-      #    - container command/args -> mlflow models serve -m models:/MODEL_NAME/SERVE_STAGE ...
-      #    - port/probes/resources -> stable values we trust
-      #    - replicas -> 1
-      #    - image -> SERVE_IMAGE (if resolved)
-      #    - bump annotation workflows/restartedAt (using replace, not add)
+      #######################################################################
+      # 7. Now we do the IMPORTANT part:
       #
-      # This guarantees:
-      #   * even same RUN_ID triggers new ReplicaSet (annotation timestamp changes)
-      #   * pod starts with correct runtime image built during training
-      - name: Patch light-serve Deployment for new RUN
+      #    (a) scale the Deployment to 0 so old pod goes away.
+      #    (b) patch Deployment template so that:
+      #        - replicas=1 "later"
+      #        - container image (if resolved)
+      #        - container command/args to serve the stage we just promoted
+      #        - ports, probes, resources
+      #    (c) update workflows/restartedAt annotation using "replace", and
+      #        if replace fails (first run?), try "add".
+      #    (d) scale back up to 1
+      #
+      # => This guarantees a fresh pod every run_id even if image didn't change.
+      #######################################################################
+      - name: Reconcile Deployment spec (image/cmd/probes) + restart
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
@@ -198,14 +219,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "[info] scaling ${SERVE_DEPLOY} to 0 first..."
+          kubectl -n "${NAMESPACE}" scale deploy "${SERVE_DEPLOY}" --replicas=0
+
           CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
-          echo "[info] serve CMD=${CMD}"
-          echo "[info] SERVE_IMAGE=${SERVE_IMAGE}"
+          echo "[info] new CMD: ${CMD}"
 
-          # 7a. Core container shape (cmd/args/ports/resources/probes/replicas=1)
+          # patch command/args/ports/resources/probes
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-            {\"op\":\"replace\",\"path\":\"/spec/replicas\",\"value\":1},
-
             {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",
              \"value\":[\"sh\",\"-c\"]},
 
@@ -251,31 +272,52 @@ jobs:
              }}
           ]"
 
-          # 7b. Only patch image if we actually resolved SERVE_IMAGE
+          # patch image IF we resolved SERVE_IMAGE from the run
           if [ -n "${SERVE_IMAGE}" ]; then
+            echo "[info] patching container image -> ${SERVE_IMAGE}"
             kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
               {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",
                \"value\":\"${SERVE_IMAGE}\"}
             ]"
           else
-            echo "::warning ::SERVE_IMAGE empty -> keeping existing container image"
+            echo "::warning ::no SERVE_IMAGE resolved, keeping existing image"
           fi
 
-          # 7c. FORCE rollout every run:
-          #     bump annotation with fresh timestamp using 'replace'
+          # bump workflows/restartedAt so the pod template hash changes every run
           TS=$(date +%s)
+          echo "[info] bumping workflows/restartedAt=${TS}"
+
+          # try replace first
+          set +e
           kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
             {\"op\":\"replace\",
              \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
              \"value\":\"${TS}\"}
           ]"
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            echo "[warn] replace failed, falling back to add"
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
+              {\"op\":\"add\",
+               \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
+               \"value\":\"${TS}\"}
+            ]"
+          fi
 
-      # 8. Wait for rollout to become Ready (new pod should spin up)
-      - name: Rollout status
+          echo "[info] scaling ${SERVE_DEPLOY} back to 1..."
+          kubectl -n "${NAMESPACE}" scale deploy "${SERVE_DEPLOY}" --replicas=1
+
+      #######################################################################
+      # 8. Wait until rollout is healthy (new pod should now spawn fresh)
+      #######################################################################
+      - name: Wait for rollout
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
           SERVE_DEPLOY: ${{ env.SERVE_DEPLOY }}
         run: |
           set -euo pipefail
           kubectl -n "${NAMESPACE}" rollout status deploy/${SERVE_DEPLOY} --timeout=300s
+          echo "[info] Pods after rollout:"
+          kubectl -n "${NAMESPACE}" get pods -l app=${SERVE_DEPLOY} -o wide
 
