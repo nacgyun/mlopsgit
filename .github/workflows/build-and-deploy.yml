@@ -249,14 +249,14 @@ jobs:
             echo "GHCR_IMAGE_REF=${IMAGE_REF}"
           } >> "$GITHUB_ENV"
 
-      - name: Cleanup old train pods (except Running or ContainerCreating)
+      - name: Cleanup old train pods (global)
         run: |
           set -euo pipefail
-          echo "[cleanup] deleting train pods not in Running or ContainerCreating"
+          echo "[cleanup] deleting train pods not Running/ContainerCreating (all previous jobs)"
 
-          PODS=$(kubectl -n "$NS_LC" get pods -l job-name="${JOB_NAME}" -o jsonpath='{.items[*].metadata.name}')
+          PODS=$(kubectl -n "$NS_LC" get pods -l job-name -o jsonpath='{.items[*].metadata.name}')
           if [ -z "$PODS" ]; then
-            echo "[cleanup] no train pods found for job-name=${JOB_NAME}"
+            echo "[cleanup] no train pods found at all"
             exit 0
           fi
 
@@ -264,13 +264,15 @@ jobs:
             phase=$(kubectl -n "$NS_LC" get pod "$pod" -o jsonpath='{.status.phase}')
             reason=$(kubectl -n "$NS_LC" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
 
-            # Running 또는 ContainerCreating만 보존
+            echo "[inspect] pod=$pod phase=$phase reason=$reason"
+
             if [ "$phase" = "Running" ] || [ "$reason" = "ContainerCreating" ]; then
-              echo "[keep] $pod (phase=$phase reason=$reason)"
-            else
-              echo "[delete] $pod (phase=$phase reason=$reason)"
-              kubectl -n "$NS_LC" delete pod "$pod" --ignore-not-found || true
+              echo "[keep] $pod"
+              continue
             fi
+
+            echo "[delete] $pod (phase=$phase reason=$reason)"
+            kubectl -n "$NS_LC" delete pod "$pod" --ignore-not-found || true
           done
 
 
