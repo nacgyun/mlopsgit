@@ -249,6 +249,17 @@ jobs:
             echo "GHCR_IMAGE_REF=${IMAGE_REF}"
           } >> "$GITHUB_ENV"
 
+      - name: Cleanup abnormal train pods
+        run: |
+         for pod in $(kubectl -n mlops get pods -l job-name=train-job -o jsonpath='{.items[*].metadata.name}'); do
+         phase=$(kubectl -n mlops get pod $pod -o jsonpath='{.status.phase}')
+         if [ "$phase" != "Succeeded" ] && [ "$phase" != "Failed" ]; then
+          echo "Deleting abnormal pod: $pod (phase=$phase)"
+          kubectl -n mlops delete pod $pod --ignore-not-found
+         fi
+         done
+
+
       - name: Render Train Job manifest
         run: |
           set -euo pipefail
