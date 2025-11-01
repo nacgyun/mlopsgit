@@ -429,7 +429,7 @@ def main():
             "run_id": run_id,
             "experiment": EXP_NAME,
         })
-
+        print(f"[PROMOTE] accuracy={acc:.5f}", flush=True)
         print("✅ Train done.")
 
 if __name__ == "__main__":
