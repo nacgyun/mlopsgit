@@ -5,7 +5,7 @@ on:
   push:
     branches: [ master ]
 
-# GitHub 발급 GITHUB_TOKEN 권한 (패키지 읽기 허용 + 워크플로우 디스패치)
+# GitHub 발급 GITHUB_TOKEN 권한 (+ actions:write 필요)
 permissions:
   contents: read
   packages: read
@@ -21,14 +21,18 @@ jobs:
       IMAGE_RUNTIME: ghcr.io/nacgyun/mlopsgit:runtime
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
-
-      # === Auto-promotion 공통 설정 ===
+      # 자동 프로모션 임계치
       PROMOTE_THRESHOLD: "0.97"
-      MODEL_NAME: light-logreg     # 실제 MLflow 등록 모델명으로 맞춰서 수정
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 파이썬 필요(정확도 비교, 보조 스크립트 등)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install kubectl if missing
         run: |
@@ -156,7 +160,6 @@ jobs:
             echo "GHCR_PAT=? (present for this run)"
           fi
 
-      # ========= NEW: Preflight ? GHCR_PAT 검증 =========
       - name: Preflight ? verify GHCR_PAT can read packages
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
@@ -184,7 +187,6 @@ jobs:
           }
           echo "? GHCR_PAT looks good."
 
-      # ========= NEW: Robust digest resolution =========
       - name: Resolve GHCR digest for runtime image
         id: digest
         env:
@@ -199,14 +201,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          IMAGE_BASE="${IMAGE_RUNTIME}"                  # ghcr.io/<owner>/<repo>:runtime
+          IMAGE_BASE="${IMAGE_RUNTIME}"
           RKEY="${IMAGE_RUNTIME_KEY}"
-          IMAGE_TAGGED="${IMAGE_BASE}-${RKEY}"           # ghcr.io/<o>/<r>:runtime-<RKEY>
-          REPO_PATH="$(echo "${IMAGE_TAGGED#ghcr.io/}" | cut -d: -f1)"   # <owner>/<repo>
-          TAG="$(echo "${IMAGE_TAGGED}" | cut -d: -f2)"                  # runtime-<RKEY>
+          IMAGE_TAGGED="${IMAGE_BASE}-${RKEY}"
+          REPO_PATH="$(echo "${IMAGE_TAGGED#ghcr.io/}" | cut -d: -f1)"
+          TAG="$(echo "${IMAGE_TAGGED}" | cut -d: -f2)"
           echo "[info] Resolving digest for ${IMAGE_TAGGED}"
 
-          # ① Kaniko 로그에서 시도
           DIGEST_FROM_LOG=""
           if kubectl -n "${NS_LC}" get job "${KANIKO_JOB_NAME}" >/dev/null 2>&1; then
             POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
@@ -320,21 +321,7 @@ jobs:
           kubectl -n "${NS_LC}" logs "$POD" -c trainer --tail=300 || true
           kubectl -n "${NS_LC}" logs "$POD" -c fetch-src --tail=100 || true
 
-      - name: On failure dump diagnostics
-        if: failure()
-        run: |
-          set -euo pipefail
-          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          echo "---- describe job ----"
-          kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
-          echo "---- describe pod ----"
-          kubectl -n "${NS_LC}" describe pod "${POD}" || true
-          echo "---- init logs ----"
-          kubectl -n "${NS_LC}" logs "${POD}" -c fetch-src --tail=200 || true
-          echo "---- trainer logs ----"
-          kubectl -n "${NS_LC}" logs "${POD}" -c trainer --tail=500 || true
-
-      # ================== NEW: 정확도 파싱 & 자동 프로모션 디스패치 ==================
+      # ====== 자동 프로모션 판단: 정확도 파싱 & 비교 ======
       - name: Parse accuracy from trainer logs
         id: read_acc
         run: |
@@ -361,38 +348,80 @@ jobs:
             exit 0
           fi
 
-          # ✅ Python 없이 비교
           DECIDE="$(awk -v a="${ACC}" -v t="${PROMOTE_THRESHOLD}" 'BEGIN{print (a+0>=t+0)?"yes":"no"}')"
           echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
           echo "acc=${ACC}" >>"$GITHUB_OUTPUT"
           echo "promote=${DECIDE}" >>"$GITHUB_OUTPUT"
 
-      - name: Auto-dispatch promote-selected-model.yml
-        if: ${{ steps.read_acc.outputs.promote == 'yes' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const workflowId = 'promote-selected-model.yml';
-            // 디스패치는 현재 브랜치 기준 (필요하면 'master'로 고정 가능)
-            const ref = (process.env.GITHUB_REF_NAME || (context.ref||'refs/heads/master').replace('refs/heads/','')) || 'master';
-            const [owner, repo] = (process.env.GITHUB_REPOSITORY || '${{ env.GITHUB_OWNER }}/${{ env.GITHUB_REPO }}').split('/');
+      # ====== MLflow RUN_ID 추출 (자동 프로모션 조건 충족 시) ======
+      - name: Extract MLflow RUN_ID from trainer logs
+        id: runid
+        if: steps.read_acc.outputs.promote == 'yes'
+        run: |
+          set -euo pipefail
+          NS="${NS_LC}"
+          JOB="${JOB_NAME}"
 
-            // run_id는 선택값: 모르면 빈문자열 전달 (promote 워크플로우가 "최신 버전"으로 처리)
-            const inputs = {
-              model_name: process.env.MODEL_NAME || 'light-logreg',
-              run_id: '',                           // (선택) 학습 로그에서 별도 추출 시 채워도 됨
-              serve_stage: 'Production'
-            };
+          echo "[info] read logs for job=${JOB} ns=${NS}"
+          LINE="$(kubectl -n "${NS}" logs -l job-name="${JOB}" --all-containers=true --tail=-1 \
+                    | tac | grep -m1 '^\[mlflow\] run_id=' || true)"
 
-            core.info(`Dispatching ${workflowId} on ${owner}/${repo}@${ref} with inputs: ${JSON.stringify(inputs)}`);
+          if [ -z "${LINE}" ]; then
+            echo "::error ::RUN_ID not found in logs"
+            exit 1
+          fi
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner,
-              repo,
-              workflow_id: workflowId,
-              ref,
-              inputs
-            });
+          RUN_ID_VAL="$(echo "${LINE}" | sed -n 's/.*run_id=\([A-Za-z0-9]\{8,64\}\).*/\1/p')"
+          if [ -z "${RUN_ID_VAL}" ]; then
+            echo "::error ::failed to parse RUN_ID from: ${LINE}"
+            exit 1
+          fi
+          echo "run_id=${RUN_ID_VAL}" >> "$GITHUB_OUTPUT"
+          echo "[info] parsed RUN_ID=${RUN_ID_VAL}"
 
-            core.info(`Dispatched ${workflowId}.`);
+      # ====== 프로모션 워크플로 자동 호출 (workflow_dispatch) ======
+      - name: Dispatch promote-selected-model (auto)
+        if: steps.read_acc.outputs.promote == 'yes'
+        env:
+          OWNER: ${{ env.OWNER_LC }}
+          REPO:  ${{ env.REPO_LC }}
+          BRANCH: master
+          PROMOTE_PAT: ${{ secrets.PROMOTE_PAT }}   # classic PAT with 'workflow' scope
+          RUN_ID_PICKED: ${{ steps.runid.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null 2>&1 || true
+            sudo apt-get install -y jq >/dev/null 2>&1 || true
+          fi
+          if [ -z "${PROMOTE_PAT:-}" ]; then
+            echo "::error ::PROMOTE_PAT secret is missing (needs 'workflow' scope)."
+            exit 1
+          fi
+          BODY=$(jq -nc --arg ref "$BRANCH" \
+                        --arg model "light-logreg" \
+                        --arg run  "$RUN_ID_PICKED" \
+                        --arg stage "Production" \
+                        '{ref:$ref, inputs:{model_name:$model, run_id:$run, serve_stage:$stage}}')
+          echo "[info] dispatch body: $BODY"
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${PROMOTE_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/promote-selected-model.yml/dispatches" \
+            -d "$BODY"
+          echo "[ok] promote workflow dispatched"
+
+      - name: On failure dump diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
+          echo "---- describe job ----"
+          kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
+          echo "---- describe pod ----"
+          kubectl -n "${NS_LC}" describe pod "${POD}" || true
+          echo "---- init logs ----"
+          kubectl -n "${NS_LC}" logs "${POD}" -c fetch-src --tail=200 || true
+          echo "---- trainer logs ----"
+          kubectl -n "${NS_LC}" logs "${POD}" -c trainer --tail=500 || true
 
