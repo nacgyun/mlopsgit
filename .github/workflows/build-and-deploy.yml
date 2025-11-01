@@ -361,7 +361,8 @@ jobs:
             exit 0
           fi
 
-          DECIDE="$(python -c "acc=float('${ACC}'); thr=float('${PROMOTE_THRESHOLD}'); print('yes' if acc>=thr else 'no')")"
+          # ✅ Python 없이 비교
+          DECIDE="$(awk -v a="${ACC}" -v t="${PROMOTE_THRESHOLD}" 'BEGIN{print (a+0>=t+0)?"yes":"no"}')"
           echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
           echo "acc=${ACC}" >>"$GITHUB_OUTPUT"
           echo "promote=${DECIDE}" >>"$GITHUB_OUTPUT"
