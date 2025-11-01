@@ -218,6 +218,36 @@ jobs:
               f.write(f"SERVE_IMAGE_REASON={reason}\n")
           PYCODE
 
+      - name: Print GHCR digest (sha) for this serve
+        env:
+          # 우선 resolve_image 스텝에서 설정된 값 사용
+          SERVE_IMAGE: ${{ env.SERVE_IMAGE }}
+          SERVE_IMAGE_REASON: ${{ env.SERVE_IMAGE_REASON }}
+          # 없을 때 MLflow 태그로 폴백
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_TRACKING_URI }}
+          RUN_ID: ${{ env.RUN_ID }}
+        run: |
+          set -euo pipefail
+
+          # 1) SERVE_IMAGE가 ghcr.io/...@sha256:... 형태면 거기서 바로 따옴
+          DIG=""
+          if [ -n "${SERVE_IMAGE:-}" ] && echo "${SERVE_IMAGE}" | grep -q '@sha256:'; then
+            DIG="${SERVE_IMAGE##*@}"   # sha256:....
+          fi
+
+          # 2) digest가 없으면 MLflow run 태그 ghcr.digest에서 폴백
+          if [ -z "${DIG}" ]; then
+            DIG="$(python -c 'import os,mlflow;mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"]);print((mlflow.get_run(os.environ["RUN_ID"]).data.tags or {}).get("ghcr.digest","").strip())' 2>/dev/null || true)"
+          fi
+
+          if [ -n "${DIG}" ]; then
+            echo "[ghcr] sha=${DIG}"
+          else
+            echo "[ghcr] sha=<unknown>"
+            echo "::warning ::No GHCR digest found in SERVE_IMAGE or MLflow tags."
+          fi
+
+
       - name: Debug resolved image (optional)
         run: |
           echo "[info] SERVE_IMAGE=${SERVE_IMAGE:-<empty>} (reason=${SERVE_IMAGE_REASON:-<none>})"
