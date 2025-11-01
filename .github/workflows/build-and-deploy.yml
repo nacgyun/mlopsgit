@@ -361,14 +361,7 @@ jobs:
             exit 0
           fi
 
-          # ✅ YAML-safe 파이썬 실행 (작은따옴표 heredoc)
-          DECIDE="$(ACC="${ACC}" THRESH="${PROMOTE_THRESHOLD}" python - <<'PY'
-import os
-acc = float(os.environ['ACC'])
-thr = float(os.environ['THRESH'])
-print("yes" if acc >= thr else "no")
-PY
-)"
+          DECIDE="$(python -c "acc=float('${ACC}'); thr=float('${PROMOTE_THRESHOLD}'); print('yes' if acc>=thr else 'no')")"
           echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
           echo "acc=${ACC}" >>"$GITHUB_OUTPUT"
           echo "promote=${DECIDE}" >>"$GITHUB_OUTPUT"
