@@ -361,10 +361,12 @@ jobs:
             exit 0
           fi
 
-          DECIDE="$(python - <<PY
-acc=float("${ACC}")
-thr=float("${PROMOTE_THRESHOLD}")
-print("yes" if acc>=thr else "no")
+          # ✅ YAML-safe 파이썬 실행 (작은따옴표 heredoc)
+          DECIDE="$(ACC="${ACC}" THRESH="${PROMOTE_THRESHOLD}" python - <<'PY'
+import os
+acc = float(os.environ['ACC'])
+thr = float(os.environ['THRESH'])
+print("yes" if acc >= thr else "no")
 PY
 )"
           echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
