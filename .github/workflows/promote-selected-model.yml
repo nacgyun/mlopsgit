@@ -8,12 +8,17 @@ on:
         required: true
         default: "light-logreg"
       run_id:
-        description: "RUN_ID from MLflow UI (the training run you want to deploy)"
-        required: true
+        description: "MLflow RUN_ID of the training run (optional; empty=use latest version)"
+        required: false
+        default: ""
       serve_stage:
-        description: "Stage to serve (ex. Production)"
+        description: "Stage to serve (e.g., Production)"
         required: true
         default: "Production"
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   promote:
@@ -40,17 +45,11 @@ jobs:
       MLFLOW_TRACKING_URI: http://10.100.0.102:32055
 
       MODEL_NAME: ${{ inputs.model_name }}
-      RUN_ID: ${{ inputs.run_id }}
+      RUN_ID: ${{ inputs.run_id }}          # 이제 선택값 (빈 값 허용)
       SERVE_STAGE: ${{ inputs.serve_stage }}
 
       #################################################################
       # --- MinIO / S3 creds for mlflow.register_model() in runner ---
-      #
-      # runner(step python)도 모델 아티팩트에 접근해야 하므로
-      # mlflow/serve 파드에서 쓰던 MinIO env 그대로 넣는다.
-      #
-      # MinIO S3 API NodePort = 32091 on node1 (10.100.0.101)
-      # (mlflow 파드 env에서 이미 저걸 쓰고 있었음)
       #################################################################
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -62,14 +61,8 @@ jobs:
       MLFLOW_ARTIFACT_ROOT: s3://mlflow
 
     steps:
-      #################################################################
-      # 0. checkout
-      #################################################################
       - uses: actions/checkout@v4
 
-      #################################################################
-      # 1. python runtime
-      #################################################################
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -84,17 +77,11 @@ jobs:
             kubernetes \
             pyyaml
 
-      #################################################################
-      # 2. kubectl
-      #################################################################
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: "v1.30.0"
 
-      #################################################################
-      # 3. in-cluster kubeconfig using this runner's SA token
-      #################################################################
       - name: Build in-cluster kubeconfig
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -119,10 +106,7 @@ jobs:
           kubectl config use-context in-cluster
 
       #################################################################
-      # 4. Promote RUN_ID into MODEL_NAME@SERVE_STAGE
-      #
-      # - register runs:/<RUN_ID>/model -> new model version (or find existing)
-      # - transition that model version to SERVE_STAGE
+      # RUN_ID가 비었으면 최신 모델 버전을, 채워졌으면 해당 RUN의 모델을 등록/찾아 승격
       #################################################################
       - name: Promote MLflow model/version (inline)
         env:
@@ -133,40 +117,41 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PYCODE'
-          import os, time, mlflow
+          import os, mlflow
           from mlflow.tracking import MlflowClient
           from mlflow.exceptions import MlflowException
 
           tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
           model_name   = os.environ["MODEL_NAME"]
-          run_id       = os.environ["RUN_ID"]
+          run_id       = (os.environ.get("RUN_ID") or "").strip()
           stage        = os.environ["SERVE_STAGE"]
 
           mlflow.set_tracking_uri(tracking_uri)
           client = MlflowClient(tracking_uri=tracking_uri)
 
-          model_uri = f"runs:/{run_id}/model"
-          print(f"[promote] registering {model_uri} -> {model_name}", flush=True)
-
           version_num = None
 
-          try:
-              mv = mlflow.register_model(model_uri=model_uri, name=model_name)
-              version_num = mv.version
-              print(f"[promote] registered new version={version_num}", flush=True)
-          except MlflowException as e:
-              print(f"[promote] register_model exception: {e}", flush=True)
-              print("[promote] trying to find existing model version for this run_id ...", flush=True)
-              for mv in client.search_model_versions(f"name='{model_name}'"):
-                  if mv.run_id == run_id:
-                      version_num = mv.version
-                      print(f"[promote] found existing version={version_num} for run_id", flush=True)
-                      break
+          if run_id:
+              model_uri = f"runs:/{run_id}/model"
+              print(f"[promote] registering {model_uri} -> {model_name}", flush=True)
+              try:
+                  mv = mlflow.register_model(model_uri=model_uri, name=model_name)
+                  version_num = mv.version
+                  print(f"[promote] registered new version={version_num}", flush=True)
+              except MlflowException as e:
+                  print(f"[promote] register_model exception: {e}", flush=True)
+                  print("[promote] trying to find existing model version for this run_id ...", flush=True)
+                  for mv in client.search_model_versions(f"name='{model_name}'"):
+                      if mv.run_id == run_id:
+                          version_num = mv.version
+                          print(f"[promote] found existing version={version_num} for run_id", flush=True)
+                          break
 
+          # run_id가 비어있거나 위 로직에서 version을 못 구한 경우 → 최신 버전 사용
           if version_num is None:
               all_versions = client.search_model_versions(f"name='{model_name}'")
               if all_versions:
-                  all_versions.sort(key=lambda m:int(m.version), reverse=True)
+                  all_versions = sorted(all_versions, key=lambda m:int(m.version), reverse=True)
                   version_num = all_versions[0].version
                   print(f"[promote] fallback using latest version={version_num}", flush=True)
               else:
@@ -188,12 +173,6 @@ jobs:
 
       #################################################################
       # 5. Resolve GHCR image info from MLflow run tags
-      #
-      # We'll write SERVE_IMAGE and SERVE_IMAGE_REASON into GITHUB_ENV.
-      # IMPORTANT FIX:
-      #   - We do NOT echo $SERVE_IMAGE in THIS SAME STEP while `set -u` is on,
-      #     because it's not in the shell env yet.
-      #   - We'll echo in the NEXT step.
       #################################################################
       - name: Resolve runtime image from MLflow run tags
         id: resolve_image
@@ -203,46 +182,42 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PYCODE'
-          import os, mlflow, sys
+          import os, mlflow
 
           tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
-          run_id = os.environ["RUN_ID"]
+          run_id = (os.environ.get("RUN_ID") or "").strip()
 
           mlflow.set_tracking_uri(tracking_uri)
-          run = mlflow.get_run(run_id)
-          tags = run.data.tags or {}
-
-          ref     = (tags.get("ghcr.ref") or "").strip()
-          image   = (tags.get("ghcr.image") or "").strip()
-          digest  = (tags.get("ghcr.digest") or "").strip()
-          tag     = (tags.get("ghcr.tag") or "").strip()
 
           serve_image = ""
-          reason = ""
+          reason = "fallback-none"
 
-          if ref:
-              serve_image = ref
-              reason = "ghcr.ref"
-          elif image and digest:
-              serve_image = f"{image}@{digest}"
-              reason = "image+digest"
-          elif image and tag:
-              serve_image = f"{image}:{tag}"
-              reason = "image+tag"
-          else:
-              serve_image = ""
-              reason = "fallback-none"
+          if run_id:
+              try:
+                  run = mlflow.get_run(run_id)
+                  tags = run.data.tags or {}
+                  ref     = (tags.get("ghcr.ref") or "").strip()
+                  image   = (tags.get("ghcr.image") or "").strip()
+                  digest  = (tags.get("ghcr.digest") or "").strip()
+                  tag     = (tags.get("ghcr.tag") or "").strip()
 
-          print(f"[resolve_image] RUN_ID={run_id}", flush=True)
-          print(f"[resolve_image] SERVE_IMAGE={serve_image} ({reason})", flush=True)
+                  if ref:
+                      serve_image = ref; reason = "ghcr.ref"
+                  elif image and digest:
+                      serve_image = f"{image}@{digest}"; reason = "image+digest"
+                  elif image and tag:
+                      serve_image = f"{image}:{tag}"; reason = "image+tag"
+              except Exception as e:
+                  print(f"[resolve_image] warn: {e}")
+
+          print(f"[resolve_image] RUN_ID={run_id or '<empty>'}", flush=True)
+          print(f"[resolve_image] SERVE_IMAGE={serve_image or '<empty>'} ({reason})", flush=True)
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"SERVE_IMAGE={serve_image}\n")
               f.write(f"SERVE_IMAGE_REASON={reason}\n")
           PYCODE
 
-      # 여기서 이제 GITHUB_ENV 반영된 값들을 안전하게 확인
-      # set -u 쓰면 빈 변수 접근 시 죽으니까 쓰지 말고, :- 로 디폴트 처리
       - name: Debug resolved image (optional)
         run: |
           echo "[info] SERVE_IMAGE=${SERVE_IMAGE:-<empty>} (reason=${SERVE_IMAGE_REASON:-<none>})"
@@ -250,9 +225,6 @@ jobs:
             echo "::warning ::Could not resolve SERVE_IMAGE from MLflow tags; will reuse current Deployment image."
           fi
 
-      #################################################################
-      # 6. Inject env vars on Deployment (MLflow/MinIO etc)
-      #################################################################
       - name: Ensure MLflow/MinIO env on Deployment
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -274,9 +246,6 @@ jobs:
             AWS_S3_ADDRESSING_STYLE=${AWS_S3_ADDRESSING_STYLE} \
             || true
 
-      #################################################################
-      # 7. Reconcile Deployment and restart fresh pod
-      #################################################################
       - name: Reconcile Deployment and restart fresh pod
         env:
           NAMESPACE: ${{ env.NAMESPACE }}
@@ -295,90 +264,43 @@ jobs:
           CMD="mlflow models serve -m models:/${MODEL_NAME}/${SERVE_STAGE} --host 0.0.0.0 --port ${SERVE_PORT} --env-manager local"
           echo "[reconcile] new CMD: ${CMD}"
 
-          # Patch container spec (command/args/ports/resources/probes)
-          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",
-             \"value\":[\"sh\",\"-c\"]},
-
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/args\",
-             \"value\":[\"${CMD}\"]},
-
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/ports\",
-             \"value\":[{\"containerPort\": ${SERVE_PORT}, \"name\": \"http\"}]},
-
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/resources\",
-             \"value\":{
-               \"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},
-               \"limits\":   {\"cpu\": \"1\",    \"memory\": \"1Gi\"}
-             }},
-
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",
-             \"value\":{
-               \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-               \"initialDelaySeconds\": 30,
-               \"periodSeconds\": 5,
-               \"timeoutSeconds\": 3,
-               \"failureThreshold\": 120,
-               \"successThreshold\": 1
-             }},
-
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",
-             \"value\":{
-               \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-               \"periodSeconds\": 5,
-               \"timeoutSeconds\": 2,
-               \"failureThreshold\": 6,
-               \"successThreshold\": 1
-             }},
-
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",
-             \"value\":{
-               \"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},
-               \"initialDelaySeconds\": 60,
-               \"periodSeconds\": 10,
-               \"timeoutSeconds\": 2,
-               \"failureThreshold\": 3,
-               \"successThreshold\": 1
-             }}
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[ \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/command\",\"value\":[\"sh\",\"-c\"]}, \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/args\",\"value\":[\"${CMD}\"]}, \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/ports\",\"value\":[{\"containerPort\": ${SERVE_PORT}, \"name\": \"http\"}]}, \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/resources\",\"value\":{\"requests\": {\"cpu\": \"200m\", \"memory\": \"512Mi\"},\"limits\": {\"cpu\": \"1\", \"memory\": \"1Gi\"}}}, \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/startupProbe\",\"value\":{\"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},\"initialDelaySeconds\": 30,\"periodSeconds\": 5,\"timeoutSeconds\": 3,\"failureThreshold\": 120,\"successThreshold\": 1}}, \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/readinessProbe\",\"value\":{\"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},\"periodSeconds\": 5,\"timeoutSeconds\": 2,\"failureThreshold\": 6,\"successThreshold\": 1}}, \
+            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/livenessProbe\",\"value\":{\"httpGet\": {\"path\": \"/ping\", \"port\": \"http\"},\"initialDelaySeconds\": 60,\"periodSeconds\": 10,\"timeoutSeconds\": 2,\"failureThreshold\": 3,\"successThreshold\": 1}} \
           ]"
 
-          # Patch image only if SERVE_IMAGE was resolved
           if [ -n "${SERVE_IMAGE:-}" ]; then
             echo "[reconcile] patching image -> ${SERVE_IMAGE}"
-            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-              {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",
-               \"value\":\"${SERVE_IMAGE}\"}
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[ \
+              {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${SERVE_CONTAINER_INDEX}/image\",\"value\":\"${SERVE_IMAGE}\"} \
             ]"
           else
             echo "::warning ::no SERVE_IMAGE resolved, keeping existing image"
           fi
 
-          # bump annotation to force new pod template hash
           TS=$(date +%s)
           echo "[reconcile] bump workflows/restartedAt=${TS}"
           set +e
-          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-            {\"op\":\"replace\",
-             \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
-             \"value\":\"${TS}\"}
+          kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[ \
+            {\"op\":\"replace\",\"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",\"value\":\"${TS}\"} \
           ]"
           RC=$?
           set -e
           if [ $RC -ne 0 ]; then
             echo "[reconcile] replace failed, doing add instead"
-            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[
-              {\"op\":\"add\",
-               \"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",
-               \"value\":\"${TS}\"}
+            kubectl -n "${NAMESPACE}" patch deploy "${SERVE_DEPLOY}" --type='json' -p="[ \
+              {\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/workflows~1restartedAt\",\"value\":\"${TS}\"} \
             ]"
           fi
 
           echo "[reconcile] scale ${SERVE_DEPLOY} -> 1"
           kubectl -n "${NAMESPACE}" scale deploy "${SERVE_DEPLOY}" --replicas=1
 
-      #################################################################
-      # 8. Wait for rollout
-      #################################################################
       - name: Wait for rollout
         env:
           NAMESPACE: ${{ env.NAMESPACE }}

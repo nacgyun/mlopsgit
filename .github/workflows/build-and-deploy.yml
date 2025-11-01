@@ -5,10 +5,11 @@ on:
   push:
     branches: [ master ]
 
-# GitHub 발급 GITHUB_TOKEN 권한 (패키지 읽기 허용)
+# GitHub 발급 GITHUB_TOKEN 권한 (패키지 읽기 허용 + 워크플로우 디스패치)
 permissions:
   contents: read
   packages: read
+  actions: write
 
 jobs:
   train-build-run:
@@ -20,6 +21,10 @@ jobs:
       IMAGE_RUNTIME: ghcr.io/nacgyun/mlopsgit:runtime
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
+
+      # === Auto-promotion 공통 설정 ===
+      PROMOTE_THRESHOLD: "0.97"
+      MODEL_NAME: light-logreg     # 실제 MLflow 등록 모델명으로 맞춰서 수정
 
     steps:
       - name: Checkout
@@ -63,7 +68,7 @@ jobs:
       - name: Check runtime tag by BUILD_KEY
         id: tagcheck
         env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}      # read:packages 권장 (없으면 fallback로 github.token 사용하지만 비공개 패키지엔 부족)
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -118,7 +123,7 @@ jobs:
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
           if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY)__' /tmp/kaniko-job.yaml; then
-            echo "❌ placeholder left in kaniko-job.yaml"; sed -n '1,180p' /tmp/kaniko-job.yaml; exit 1
+            echo "? placeholder left in kaniko-job.yaml"; sed -n '1,180p' /tmp/kaniko-job.yaml; exit 1
           fi
 
           kubectl -n "${NS_LC}" create --dry-run=client -f /tmp/kaniko-job.yaml -o yaml >/dev/null
@@ -138,21 +143,21 @@ jobs:
           if [ -z "$RKEY" ]; then RKEY="${GIT_SHA}"; fi
           echo "IMAGE_RUNTIME_KEY=${RKEY}" >> $GITHUB_ENV
           echo "IMAGE_RUNTIME_SHA=${IMAGE_RUNTIME}-${RKEY}" >> $GITHUB_ENV
-      - name: Debug — is GHCR_PAT visible to this run?
+
+      - name: Debug ? is GHCR_PAT visible to this run?
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
           set -euo pipefail
           if [ -z "${GHCR_PAT:-}" ]; then
-            echo "GHCR_PAT=⛔ (not set in this workflow run)"
+            echo "GHCR_PAT=? (not set in this workflow run)"
             echo "Tip: Repo → Settings → Secrets and variables → Actions → New secret: GHCR_PAT"
           else
-            echo "GHCR_PAT=✅ (present for this run)"
+            echo "GHCR_PAT=? (present for this run)"
           fi
 
-
-      # ========= NEW: Preflight — GHCR_PAT 검증 =========
-      - name: Preflight — verify GHCR_PAT can read packages
+      # ========= NEW: Preflight ? GHCR_PAT 검증 =========
+      - name: Preflight ? verify GHCR_PAT can read packages
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
           OWNER_LC: ${{ env.OWNER_LC }}
@@ -161,23 +166,23 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GHCR_PAT:-}" ]; then
-            echo "❌ GHCR_PAT is not set. Create a classic PAT with scope read:packages (and repo if private), then add it to repo secrets."
+            echo "? GHCR_PAT is not set. Create a classic PAT with scope read:packages (and repo if private), then add it to repo secrets."
             exit 1
           fi
           curl -fsSL -u "${ACTOR}:${GHCR_PAT}" https://api.github.com/user >/dev/null || {
-            echo "❌ PAT invalid or SSO not enabled. If your org enforces SSO, click 'Enable SSO' on this PAT."
+            echo "? PAT invalid or SSO not enabled. If your org enforces SSO, click 'Enable SSO' on this PAT."
             exit 1
           }
           TOKEN_JSON=$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
             "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER_LC}/${REPO_LC}:pull") || {
-            echo "❌ Failed to get registry token. Ensure package visibility/permission allows this repo/workflow to read."
+            echo "? Failed to get registry token. Ensure package visibility/permission allows this repo/workflow to read."
             exit 1
           }
           echo "$TOKEN_JSON" | jq -re '.token' >/dev/null || {
-            echo "❌ Registry token missing. Check Manage access on the package (or make it public)."
+            echo "? Registry token missing. Check Manage access on the package (or make it public)."
             exit 1
           }
-          echo "✅ GHCR_PAT looks good."
+          echo "? GHCR_PAT looks good."
 
       # ========= NEW: Robust digest resolution =========
       - name: Resolve GHCR digest for runtime image
@@ -221,7 +226,7 @@ jobs:
               "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
               | jq -r '.token')"
             if [ -z "${REG_TOKEN}" ] || [ "${REG_TOKEN}" = "null" ]; then
-              echo "❌ Failed to obtain registry token. Check package permission/visibility and PAT scopes (read:packages, SSO)."
+              echo "? Failed to obtain registry token. Check package permission/visibility and PAT scopes (read:packages, SSO)."
               exit 1
             fi
 
@@ -234,7 +239,7 @@ jobs:
 
             DIGEST="$(awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"");print $2}' "${HDRS}" | tail -n1)"
             if [ -z "${DIGEST}" ]; then
-              echo "❌ Docker-Content-Digest not found. Is the tag present? Check headers below."
+              echo "? Docker-Content-Digest not found. Is the tag present? Check headers below."
               sed -n '1,200p' "${HDRS}" || true
               exit 1
             fi
@@ -275,7 +280,6 @@ jobs:
             kubectl -n "$NS_LC" delete pod "$pod" --ignore-not-found || true
           done
 
-
       - name: Render Train Job manifest
         run: |
           set -euo pipefail
@@ -294,7 +298,7 @@ jobs:
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
 
           if grep -qE "__[A-Z0-9_]+__" /tmp/train-job.yaml; then
-            echo "❌ placeholder left in train-job.yaml"
+            echo "? placeholder left in train-job.yaml"
             grep -nE "__[A-Z0-9_]+__" /tmp/train-job.yaml || true
             exit 1
           fi
@@ -329,4 +333,70 @@ jobs:
           kubectl -n "${NS_LC}" logs "${POD}" -c fetch-src --tail=200 || true
           echo "---- trainer logs ----"
           kubectl -n "${NS_LC}" logs "${POD}" -c trainer --tail=500 || true
-   
+
+      # ================== NEW: 정확도 파싱 & 자동 프로모션 디스패치 ==================
+      - name: Parse accuracy from trainer logs
+        id: read_acc
+        run: |
+          set -euo pipefail
+          NS="${NS_LC}"
+          JOB="${JOB_NAME}"
+
+          echo "[info] read logs for job=${JOB} ns=${NS}"
+          LINE="$(kubectl -n "${NS}" logs -l job-name="${JOB}" --all-containers=true --tail=-1 \
+                    | tac | grep -m1 '^\[PROMOTE\] accuracy=' || true)"
+
+          if [ -z "${LINE}" ]; then
+            echo "::warning::[PROMOTE] marker not found in logs. Skip auto-promotion."
+            echo "acc=NA" >>"$GITHUB_OUTPUT"
+            echo "promote=no" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ACC="$(echo "${LINE}" | sed -n 's/.*accuracy=\([0-9.]\+\).*/\1/p')"
+          if [ -z "${ACC}" ]; then
+            echo "::warning::Unable to parse accuracy from: ${LINE}"
+            echo "acc=NA" >>"$GITHUB_OUTPUT"
+            echo "promote=no" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DECIDE="$(python - <<PY
+acc=float("${ACC}")
+thr=float("${PROMOTE_THRESHOLD}")
+print("yes" if acc>=thr else "no")
+PY
+)"
+          echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
+          echo "acc=${ACC}" >>"$GITHUB_OUTPUT"
+          echo "promote=${DECIDE}" >>"$GITHUB_OUTPUT"
+
+      - name: Auto-dispatch promote-selected-model.yml
+        if: ${{ steps.read_acc.outputs.promote == 'yes' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowId = 'promote-selected-model.yml';
+            // 디스패치는 현재 브랜치 기준 (필요하면 'master'로 고정 가능)
+            const ref = (process.env.GITHUB_REF_NAME || (context.ref||'refs/heads/master').replace('refs/heads/','')) || 'master';
+            const [owner, repo] = (process.env.GITHUB_REPOSITORY || '${{ env.GITHUB_OWNER }}/${{ env.GITHUB_REPO }}').split('/');
+
+            // run_id는 선택값: 모르면 빈문자열 전달 (promote 워크플로우가 "최신 버전"으로 처리)
+            const inputs = {
+              model_name: process.env.MODEL_NAME || 'light-logreg',
+              run_id: '',                           // (선택) 학습 로그에서 별도 추출 시 채워도 됨
+              serve_stage: 'Production'
+            };
+
+            core.info(`Dispatching ${workflowId} on ${owner}/${repo}@${ref} with inputs: ${JSON.stringify(inputs)}`);
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: workflowId,
+              ref,
+              inputs
+            });
+
+            core.info(`Dispatched ${workflowId}.`);
+
