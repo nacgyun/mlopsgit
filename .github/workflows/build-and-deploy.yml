@@ -23,6 +23,12 @@ jobs:
       GITHUB_REPO: mlopsgit
       # 자동 프로모션 임계치
       PROMOTE_THRESHOLD: "0.97"
+      MINIO_ENDPOINT: http://minio.mlops.svc.cluster.local:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      DATA_BUCKET: data
+      DATA_KEY: telco/WA_Fn-UseC_-Telco-Customer-Churn.csv
+      MODEL_BUCKET: models
 
     steps:
       - name: Checkout

@@ -12,18 +12,20 @@ from mlflow.tracking import MlflowClient
 from mlflow.exceptions import RestException
 from mlflow.models import infer_signature
 from sklearn.base import clone
-
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, log_loss
 from sklearn.linear_model import SGDClassifier
 from pathlib import Path
 
+# 🔹 로그 함수 모듈 임포트
+from logs import log_json_line, log_ghcr_metadata_to_mlflow
+
 # ===== 파라미터 / 설정 =====
 EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
-# 기본 러닝타임 타깃(초) — 대략 5분
+# 기본 러닝타임 타깃(초)
 TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "300"))
 
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
@@ -48,18 +50,6 @@ LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))
 LR_INITIAL      = float(os.getenv("LR_INITIAL", "0.01"))
 RANDOM_STATE    = int(os.getenv("SEED", "42"))
 EMA_ALPHA       = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
-
-# 🔸 로그 설정: Promtail/Loki용 JSON 로그 출력 (기본 ON)
-LOG_JSON        = os.getenv("LOG_JSON", "1") == "1"
-
-def log_json_line(payload: dict):
-    """한 줄 JSON 로그 출력 (stdout). Promtail이 수집해 Loki로 보냄."""
-    if not LOG_JSON:
-        return
-    try:
-        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
-    except Exception:
-        pass
 
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
     exp = client.get_experiment_by_name(name)
@@ -124,7 +114,6 @@ def batch_iter(X, y, batch_size, shuffle=True, seed=None):
         yield X[b], y[b]
 
 def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
-    """추가 학습(로그 반영 X, 연산량만 증가)."""
     if passes <= 0:
         return
     rng = np.random.default_rng(seed)
@@ -141,7 +130,6 @@ def extra_training_burn(template_clf, X, y, passes, batch_size, noise, seed):
         shadow.partial_fit(Xb, y[idx])
 
 def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_deadline_sec):
-    """목표 벽시계 시간에 맞추기 위한 burn 반복."""
     if not BURN_ENABLE:
         return
     start = time.perf_counter()
@@ -156,42 +144,6 @@ def spend_time_to_target(template_clf, X, y, batch_size, noise, seed, target_dea
             seed=rng_seed
         )
         rng_seed += 1
-
-# === NEW: GHCR 메타데이터를 MLflow 태그/아티팩트로 남기는 헬퍼 ===
-def log_ghcr_metadata_to_mlflow():
-    """
-    GHCR 관련 ENV를 읽어 MLflow 태그로 저장.
-    또한 (선택) 동일 내용을 build/image.json으로 기록해 아티팩트 업로드.
-    """
-    ghcr_image   = os.getenv("GHCR_IMAGE", "")
-    ghcr_tag     = os.getenv("GHCR_TAG", "")
-    ghcr_digest  = os.getenv("GHCR_DIGEST", "")
-    ghcr_ref     = os.getenv("GHCR_IMAGE_REF", "")
-    run_id_ci    = os.getenv("GITHUB_RUN_ID", "")
-    git_sha      = os.getenv("GIT_SHA", "")
-
-    mlmod.set_tag("ci.run_id", run_id_ci)
-    mlmod.set_tag("git.sha",   git_sha)
-    mlmod.set_tag("ghcr.image",  ghcr_image)
-    mlmod.set_tag("ghcr.tag",    ghcr_tag)
-    mlmod.set_tag("ghcr.digest", ghcr_digest)
-    mlmod.set_tag("ghcr.ref",    ghcr_ref)
-
-    try:
-        meta = {
-            "image": ghcr_image,
-            "tag": ghcr_tag,
-            "digest": ghcr_digest,
-            "ref": ghcr_ref,
-            "run_id": run_id_ci,
-            "git_sha": git_sha
-        }
-        Path("build").mkdir(exist_ok=True)
-        with open("build/image.json", "w") as f:
-            json.dump(meta, f, indent=2)
-        mlmod.log_artifact("build/image.json", artifact_path="build")
-    except Exception:
-        pass
 
 def main():
     wall_start = time.perf_counter()
@@ -223,7 +175,7 @@ def main():
         run_id = run.info.run_id
         print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
 
-        # === NEW: GHCR 메타데이터를 RUN 시작 직후 기록 ===
+        # === GHCR 메타데이터 기록 ===
         log_ghcr_metadata_to_mlflow()
 
         mlmod.log_params({
@@ -252,7 +204,6 @@ def main():
             tol=None
         )
 
-        # 초기 partial_fit (classes 세팅)
         clf.partial_fit(X_train[:BATCH_SIZE], y_train[:BATCH_SIZE], classes=classes)
 
         f1_hist = []
@@ -261,7 +212,6 @@ def main():
         for epoch in range(1, EPOCHS + 1):
             t_epoch = time.perf_counter()
 
-            # 본 학습
             for loop in range(LOOPS_PER_EPOCH):
                 for Xb, yb in batch_iter(
                     X_train, y_train, BATCH_SIZE, shuffle=True,
@@ -269,7 +219,6 @@ def main():
                 ):
                     clf.partial_fit(Xb, yb)
 
-            # 고정 burn
             if BURN_ENABLE and BURN_PASSES > 0:
                 extra_training_burn(
                     template_clf=clf,
@@ -281,8 +230,6 @@ def main():
                 )
 
             compute_sec = time.perf_counter() - t_epoch
-
-            # 평가/로그
             y_pred = clf.predict(X_test)
             acc = float(accuracy_score(y_test, y_pred))
             f1  = float(f1_score(y_test, y_pred, average="macro"))
@@ -328,7 +275,6 @@ def main():
             if SLEEP_SEC > 0:
                 time.sleep(SLEEP_SEC)
 
-            # 타임 타깃 보정
             remaining_to_target = TARGET_WALL_SEC - (time.perf_counter() - wall_start)
             if BURN_ENABLE and remaining_to_target > 5.0:
                 per_epoch_cap = float(os.getenv("PER_EPOCH_SPEND_CAP_SEC", "60"))
@@ -347,11 +293,9 @@ def main():
                 print(f"[info] target wall time ({TARGET_WALL_SEC:.0f}s) reached. stopping early.")
                 break
 
-        # 총 학습 시간(더미 키 유지용)
         total_time = time.perf_counter() - wall_start
         mlmod.log_metric("train_time_total_sec", total_time)
 
-        # ===== 아티팩트 =====
         cm = confusion_matrix(y_test, clf.predict(X_test))
         plt.figure(figsize=(5, 4))
         im = plt.imshow(cm, interpolation="nearest")
@@ -387,7 +331,6 @@ def main():
             json.dump(X_test[:2].tolist(), f)
         mlmod.log_artifact("input_example.json")
 
-        # ── 최종 지표/로그
         final_acc_num = float(accuracy_score(y_test, clf.predict(X_test)))
         log_json_line({
             "event": "train_done",
@@ -398,9 +341,7 @@ def main():
             "experiment": EXP_NAME,
         })
 
-        # 🚩 자동 프로모션 트리거용 마커
         print(f"[PROMOTE] accuracy={final_acc_num:.5f}", flush=True)
-
         print("✅ Train done.", flush=True)
 
 if __name__ == "__main__":
