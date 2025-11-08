@@ -10,15 +10,16 @@ MinIO(S3) 경로의 Telco Churn CSV를 읽어 학습하고 MLflow에 기록/등�
 - (MinIO 접속)
   - MLFLOW_S3_ENDPOINT_URL=http://<nodeip>:<nodeport>
   - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-  - AWS_S3_ADDRESSING_STYLE=path (권장)
-  - AWS_S3_FORCE_PATH_STYLE=true (권장)
+  - AWS_S3_ADDRESSING_STYLE=path
+  - AWS_S3_FORCE_PATH_STYLE=true
 
 선택 ENV
 - REGISTER_MODEL_NAME=ChurnModel
 - MODEL_STAGE=Staging|Production
 
-필수 패키지: pandas, scikit-learn, mlflow, s3fs
+필수 패키지: pandas, scikit-learn, mlflow, s3fs, fsspec
 """
+
 import os
 import time
 import json
@@ -42,30 +43,30 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, log_loss
 
-# 🔹 로그 함수 모듈(있으면 사용, 없어도 동작)
+# 선택 로그 모듈 (없어도 동작)
 try:
     from logs import log_json_line, log_ghcr_metadata_to_mlflow
 except Exception:
-    def log_json_line(obj):
-        print(json.dumps(obj, ensure_ascii=False))
-    def log_ghcr_metadata_to_mlflow():
-        pass
+    def log_json_line(obj): print(json.dumps(obj, ensure_ascii=False))
+    def log_ghcr_metadata_to_mlflow(): pass
 
-# ===== 파라미터 / 설정 =====
+# ========= 설정 =========
 EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "telco-churn")
 RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
+# 학습 루프 파라미터
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "20"))
-BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "2048"))  # 파이프라인 전체 fit이므로 크~게
+BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "4096"))
 RANDOM_STATE    = int(os.getenv("SEED", "42"))
 LR_ALPHA        = float(os.getenv("LR_ALPHA", "0.0005"))
+
 TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "180"))
 EMA_ALPHA       = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
 
 TELCO_CSV_URI   = os.getenv("TELCO_CSV_URI", "s3://data/telco/Telco-Customer-Churn.csv")
 
-# ========= 공용 유틸 =========
 
+# ========= 유틸 =========
 def ensure_experiment_id(name: str, client: MlflowClient, retries: int = 20, sleep: float = 0.25) -> str:
     exp = client.get_experiment_by_name(name)
     if exp is None:
@@ -120,70 +121,69 @@ def start_run_with_retry(exp_id: str, run_name: str, retries: int = 12, delay: f
 
 
 def _s3_storage_options_from_env():
-    """pandas.read_csv(storage_options=...)에 전달할 MinIO/S3 옵션 구성"""
+    """pandas.read_csv(storage_options=...)에 전달할 MinIO/S3 옵션 구성 (호환성 위해 단순화)"""
     opts = {}
     key = os.getenv("AWS_ACCESS_KEY_ID")
     sec = os.getenv("AWS_SECRET_ACCESS_KEY")
     tok = os.getenv("AWS_SESSION_TOKEN")
     endpoint = os.getenv("MLFLOW_S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
-    addressing = os.getenv("AWS_S3_ADDRESSING_STYLE", "path")
-    force_path = os.getenv("AWS_S3_FORCE_PATH_STYLE", "true").lower() in ("1","true","yes")
 
     if key: opts["key"] = key
     if sec: opts["secret"] = sec
     if tok: opts["token"] = tok
     if endpoint:
+        # ✅ aiobotocore 조합 호환 위해 endpoint_url만 설정
         opts.setdefault("client_kwargs", {})["endpoint_url"] = endpoint
-    if force_path or addressing == "path":
-        opts.setdefault("client_kwargs", {})["config_kwargs"] = {"s3": {"addressing_style": "path"}}
     return opts
+
+
+def batch_iter(X, y, batch_size, shuffle=True, seed=None):
+    n = len(X)
+    idx = np.arange(n)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(idx)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        b = idx[start:end]
+        yield X[b], y[b]
 
 
 def load_telco_churn(csv_uri: str):
     storage_options = _s3_storage_options_from_env() if csv_uri.startswith("s3://") else None
     df = pd.read_csv(csv_uri, storage_options=storage_options)
 
-    # 기본 정제/형 변환
+    # 기본 전처리
     for c in ("customerID", "CustomerID", "customerId"):
         if c in df.columns:
             df = df.drop(columns=[c]); break
+
     if "TotalCharges" in df.columns:
         df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
-    df = df.dropna(subset=[col for col in ["Churn", "TotalCharges"] if col in df.columns])
 
-    # 타깃
+    # 타깃/결측 제거
+    df = df.dropna(subset=[col for col in ["Churn", "TotalCharges"] if col in df.columns])
     y = (df["Churn"].astype(str).str.strip().str.lower() == "yes").astype(int)
     X = df.drop(columns=["Churn"])
 
-    # 타입 분리
+    # 컬럼 타입 분리
     cat_cols = [c for c in X.columns if X[c].dtype == "object"]
     num_cols = [c for c in X.columns if c not in cat_cols]
 
+    # 전처리자: 호환성 위해 OneHotEncoder(sparse=False) 사용
     preproc = ColumnTransformer(
         transformers=[
-            ("num", StandardScaler(with_mean=False), num_cols),
-            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
+            ("num", StandardScaler(), num_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse=False), cat_cols),
         ],
         remainder="drop",
         sparse_threshold=0.0,
     )
 
-    clf = SGDClassifier(
-        loss="log_loss",
-        penalty="l2",
-        alpha=LR_ALPHA,
-        learning_rate="optimal",
-        random_state=RANDOM_STATE,
-        fit_intercept=True,
-        max_iter=1,   # fit을 여러 epoch 반복 호출
-        warm_start=False,
-        tol=None,
-    )
-
-    pipe = Pipeline(steps=[("preproc", preproc), ("clf", clf)])
-    return X, y, pipe, cat_cols, num_cols
+    return X, y, preproc, cat_cols, num_cols
 
 
+# ========= 메인 =========
 def main():
     wall_start = time.perf_counter()
 
@@ -192,9 +192,28 @@ def main():
     client = MlflowClient(tracking_uri=tracking_uri)
 
     # 데이터 로드
-    X_all, y_all, model, cat_cols, num_cols = load_telco_churn(TELCO_CSV_URI)
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_all, y_all, preproc, cat_cols, num_cols = load_telco_churn(TELCO_CSV_URI)
+    X_train_df, X_test_df, y_train, y_test = train_test_split(
         X_all, y_all, test_size=0.30, random_state=0, stratify=y_all
+    )
+
+    # 전처리 적합 & 변환 -> ndarray
+    preproc.fit(X_train_df)
+    X_train = preproc.transform(X_train_df)
+    X_test  = preproc.transform(X_test_df)
+
+    # SGD 분류기 (partial_fit로 에폭 학습)
+    classes = np.array([0, 1], dtype=int)
+    clf = SGDClassifier(
+        loss="log_loss",
+        penalty="l2",
+        alpha=LR_ALPHA,
+        learning_rate="optimal",
+        random_state=RANDOM_STATE,
+        fit_intercept=True,
+        max_iter=1,
+        warm_start=False,
+        tol=None,
     )
 
     # 실험 보장
@@ -204,7 +223,7 @@ def main():
         run_id = run.info.run_id
         print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
 
-        # GHCR 메타데이터 기록(선택)
+        # (선택) GHCR 메타데이터 기록
         log_ghcr_metadata_to_mlflow()
 
         mlmod.log_params({
@@ -216,29 +235,31 @@ def main():
             "target_wall_sec": TARGET_WALL_SEC,
         })
 
+        # 첫 partial_fit(classes 지정)
+        first_n = min(BATCH_SIZE, len(X_train))
+        clf.partial_fit(X_train[:first_n], y_train[:first_n], classes=classes)
+
         f1_hist = []
         ema = None
 
-        # 여러 epoch 동안 전체 fit — SGD라 빠름
         for epoch in range(1, EPOCHS + 1):
             t_epoch = time.perf_counter()
-            model.fit(X_train, y_train)
+
+            for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True,
+                                     seed=RANDOM_STATE + epoch * 1000):
+                clf.partial_fit(Xb, yb)
 
             compute_sec = time.perf_counter() - t_epoch
-            y_pred = model.predict(X_test)
+            y_pred = clf.predict(X_test)
             acc = float(accuracy_score(y_test, y_pred))
             f1  = float(f1_score(y_test, y_pred, average="macro"))
             try:
-                y_proba = model.predict_proba(X_test)
+                y_proba = clf.predict_proba(X_test)
                 ll = float(log_loss(y_test, y_proba))
             except Exception:
                 ll = float("nan")
 
-            if ema is None:
-                ema = compute_sec
-            else:
-                ema = EMA_ALPHA * compute_sec + (1 - EMA_ALPHA) * ema
-
+            ema = compute_sec if ema is None else (EMA_ALPHA * compute_sec + (1 - EMA_ALPHA) * ema)
             elapsed = time.perf_counter() - wall_start
             eta_sec = max(0.0, TARGET_WALL_SEC - elapsed)
 
@@ -253,7 +274,8 @@ def main():
             }, step=epoch)
 
             f1_hist.append(f1)
-            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
+            print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={compute_sec:.2f}s "
+                  f"elapsed={elapsed:.1f}s ETA~{eta_sec:.1f}s")
             log_json_line({
                 "event": "epoch_metric",
                 "epoch": epoch,
@@ -271,15 +293,15 @@ def main():
         total_time = time.perf_counter() - wall_start
         mlmod.log_metric("train_time_total_sec", total_time)
 
-        # Confusion Matrix
-        cm = confusion_matrix(y_test, model.predict(X_test))
+        # 혼동행렬 저장
+        cm = confusion_matrix(y_test, clf.predict(X_test))
         plt.figure(figsize=(5, 4))
         im = plt.imshow(cm, interpolation="nearest")
         plt.title("Confusion Matrix (Telco)")
         plt.colorbar(im)
         tick = np.arange(2)
-        plt.xticks(tick, ["stay","churn"], rotation=0)
-        plt.yticks(tick, ["stay","churn"])
+        plt.xticks(tick, ["stay", "churn"], rotation=0)
+        plt.yticks(tick, ["stay", "churn"])
         for i in range(cm.shape[0]):
             for j in range(cm.shape[1]):
                 plt.text(j, i, cm[i, j], ha="center", va="center")
@@ -287,7 +309,7 @@ def main():
         plt.savefig("confusion_matrix.png", bbox_inches="tight")
         mlmod.log_artifact("confusion_matrix.png", artifact_path="plots")
 
-        # F1 History
+        # F1 히스토리 저장
         plt.figure(figsize=(6, 3.5))
         plt.plot(range(1, len(f1_hist)+1), f1_hist, marker="o")
         plt.title("F1 over Epochs (Telco)")
@@ -295,24 +317,22 @@ def main():
         plt.savefig("learning_curve_f1.png", bbox_inches="tight")
         mlmod.log_artifact("learning_curve_f1.png", artifact_path="plots")
 
-        # 모델 로깅
+        # 파이프라인(전처리+분류기)로 저장
         from mlflow import sklearn as ml_sklearn
-        sig = infer_signature(X_train, model.predict(X_train))
+        final_pipe = Pipeline(steps=[("preproc", preproc), ("clf", clf)])
+        sig = infer_signature(X_train_df, final_pipe.predict(X_train_df.head(2)))
         ml_sklearn.log_model(
-            sk_model=model,
+            sk_model=final_pipe,
             artifact_path="model",
             signature=sig,
-            input_example=X_train.head(2) if hasattr(X_train, "head") else X_train[:2],
+            input_example=X_train_df.head(2),
         )
 
         with open("input_example.json", "w") as f:
-            if hasattr(X_train, "head"):
-                json.dump(X_train.head(2).to_dict(orient="records"), f)
-            else:
-                json.dump(np.asarray(X_train[:2]).tolist(), f)
+            json.dump(X_train_df.head(2).to_dict(orient="records"), f)
         mlmod.log_artifact("input_example.json")
 
-        final_acc_num = float(accuracy_score(y_test, model.predict(X_test)))
+        final_acc_num = float(accuracy_score(y_test, final_pipe.predict(X_test_df)))
         log_json_line({
             "event": "train_done",
             "accuracy": final_acc_num,
