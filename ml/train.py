@@ -26,7 +26,7 @@ EXP_NAME        = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-rf")
 RUN_NAME        = (os.getenv("GIT_SHA", "")[:12] or "run")
 
 # 기본 러닝타임 타깃(초)
-TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "300"))
+TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "180"))
 
 EPOCHS          = int(os.getenv("MLFLOW_EPOCHS", "40"))
 BATCH_SIZE      = int(os.getenv("TRAIN_BATCH_SIZE", "64"))
