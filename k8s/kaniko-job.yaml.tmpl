@@ -4,58 +4,41 @@ metadata:
   name: __KANIKO_JOB_NAME__
   namespace: __NAMESPACE__
   labels:
-    app: kaniko
-    purpose: runtime-build
+    allow-egress-internet: "true"
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: kaniko
-        purpose: runtime-build
+        allow-egress-internet: "true"
     spec:
       restartPolicy: Never
-
-      # 클러스터가 프록시/DNS 느릴 때 완화 옵션(선택)
-      dnsConfig:
-        options:
-          - { name: ndots, value: "1" }
-          - { name: timeout, value: "2" }
-          - { name: attempts, value: "2" }
-
       containers:
         - name: kaniko
-          image: gcr.io/kaniko-project/executor:v1.23.0
-          imagePullPolicy: IfNotPresent
-          args:
-            # Git 컨텍스트: 특정 커밋 고정
-            - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
-            - --dockerfile=Dockerfile.runtime
-
-            # 빌드 산출물 푸시 (content-hash 태그 + latest runtime)
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
-
-            # 캐시 사용 (레포는 /cache 네임스페이스 하위)
-            - --cache=true
-            - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
-
-            # 로그 상세
-            - --verbosity=info
+          image: gcr.io/kaniko-project/executor:latest
           env:
-            - name: GODEBUG
-              value: "ipv6=0"
             - name: DOCKER_CONFIG
               value: /kaniko/.docker
+            - name: SSL_CERT_DIR
+              value: /etc/ssl/certs
+          args:
+            # 공개 repo면 git context 그대로 사용 (특정 커밋)
+            - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
+            - --dockerfile=./Dockerfile.runtime
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:sha-__GIT_SHA__
+            - --snapshotMode=redo
+            - --compressed-caching=false
+            - --verbosity=info
           volumeMounts:
             - name: docker-config
               mountPath: /kaniko/.docker
-
+              readOnly: true
       volumes:
         - name: docker-config
           secret:
-            secretName: docker-config        # /.docker/config.json 를 담은 시크릿
+            secretName: ghcr-push
             items:
-              - key: .dockerconfigjson
+              - key: config.json
                 path: config.json
 
