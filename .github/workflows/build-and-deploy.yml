@@ -96,24 +96,27 @@ jobs:
           fi
           echo "build_key=${BUILD_KEY}" >> "$GITHUB_OUTPUT"
 
-          has_build_tag() {
+          # helper: does a tag exist in GHCR?
+          tag_exists() {
+            local tag="runtime-$1"
             curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
-              "https://ghcr.io/v2/${OWNER}/${REPO}/tags/list" \
-              | jq -e --arg t "runtime-${BUILD_KEY}" '.tags[]? | select(.==$t)' >/dev/null
+              "https://ghcr.io/v2/${OWNER}/${REPO}/manifests/${tag}" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" >/dev/null
           }
 
           NEED_BUILD=false
           if [ -z "${BUILD_KEY}" ]; then
             NEED_BUILD=true
-          elif has_build_tag; then
+          elif tag_exists "${BUILD_KEY}"; then
             NEED_BUILD=false
           else
             NEED_BUILD=true
           fi
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
+      # === 강제 게이트: 태그 없으면 반드시 Kaniko 실행 ===
       - name: Kaniko runtime-build (render → apply)
-        if: steps.tagcheck.outputs.need_build == 'true' && steps.changes.outputs.runtime_image == 'true'
+        if: steps.tagcheck.outputs.need_build == 'true'
         env:
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
@@ -137,19 +140,10 @@ jobs:
           echo "----- rendered kaniko-job -----"; sed -n '1,200p' /tmp/kaniko-job.yaml
 
           kubectl -n "${NS_LC}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found --wait=true || true
-          if ! kubectl -n "${NS_LC}" apply -f /tmp/kaniko-job.yaml; then
-            echo "::error ::Failed to apply Kaniko job"
-            kubectl -n "${NS_LC}" get events --sort-by=.metadata.creationTimestamp | tail -40 || true
-            exit 1
-          fi
+          kubectl -n "${NS_LC}" apply -f /tmp/kaniko-job.yaml
+          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=45m "job/${KANIKO_JOB_NAME}"
 
-          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=30m "job/${KANIKO_JOB_NAME}" || {
-            echo "::error ::Kaniko job did not complete"
-            kubectl -n "${NS_LC}" describe job "${KANIKO_JOB_NAME}" || true
-            kubectl -n "${NS_LC}" get pods -l job-name="${KANIKO_JOB_NAME}" -o wide || true
-            exit 1
-          }
-
+          # 빌드 로그 요약
           kubectl -n "${NS_LC}" logs -l job-name="${KANIKO_JOB_NAME}" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
       - name: Compute IMAGE tag (prefer BUILD_KEY; fallback SHA)
@@ -159,84 +153,6 @@ jobs:
           if [ -z "$RKEY" ]; then RKEY="${GIT_SHA}"; fi
           echo "IMAGE_RUNTIME_KEY=${RKEY}" >> $GITHUB_ENV
           echo "IMAGE_RUNTIME_SHA=${IMAGE_RUNTIME}-${RKEY}" >> $GITHUB_ENV
-
-      - name: Preflight GHCR (optional)
-        env:
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          OWNER_LC: ${{ env.OWNER_LC }}
-          REPO_LC:  ${{ env.REPO_LC }}
-          ACTOR:    ${{ github.actor }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GHCR_PAT:-}" ]; then
-            echo "::warning ::GHCR_PAT not set; will skip registry digest resolution"
-            exit 0
-          fi
-          curl -fsSL -u "${ACTOR}:${GHCR_PAT}" https://api.github.com/user >/dev/null || {
-            echo "::warning ::PAT invalid or SSO not enabled; skip digest resolution"
-            exit 0
-          }
-
-      - name: Resolve GHCR digest for runtime image (best-effort)
-        id: digest
-        continue-on-error: true
-        env:
-          IMAGE_RUNTIME: ${{ env.IMAGE_RUNTIME }}
-          IMAGE_RUNTIME_KEY: ${{ env.IMAGE_RUNTIME_KEY }}
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          OWNER_LC: ${{ env.OWNER_LC }}
-          REPO_LC:  ${{ env.REPO_LC }}
-          ACTOR:    ${{ github.actor }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GHCR_PAT:-}" ]; then
-            echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-
-          IMAGE_BASE="${IMAGE_RUNTIME}"
-          RKEY="${IMAGE_RUNTIME_KEY}"
-          IMAGE_TAGGED="${IMAGE_BASE}-${RKEY}"
-          REPO_PATH="$(echo "${IMAGE_TAGGED#ghcr.io/}" | cut -d: -f1)"
-          TAG="$(echo "${IMAGE_TAGGED}" | cut -d: -f2)"
-
-          REG_TOKEN="$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" | jq -r '.token')" || true
-
-          if [ -z "${REG_TOKEN:-}" ] || [ "${REG_TOKEN}" = "null" ]; then
-            echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-
-          HDRS="$(mktemp)"
-          ACCEPT_HEADER="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-          if curl -fsSL -D "${HDRS}" -o /dev/null \
-               -H "Authorization: Bearer ${REG_TOKEN}" \
-               -H "Accept: ${ACCEPT_HEADER}" \
-               "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}"; then
-            DIGEST="$(awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"");print $2}' "${HDRS}" | tail -n1)"
-            if [ -n "${DIGEST}" ]; then
-              {
-                echo "GHCR_IMAGE=ghcr.io/${REPO_PATH}"
-                echo "GHCR_TAG=${TAG}"
-                echo "GHCR_DIGEST=${DIGEST}"
-                echo "GHCR_IMAGE_REF=ghcr.io/${REPO_PATH}@${DIGEST}"
-              } >> "$GITHUB_ENV"
-              echo "skip=0" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-          echo "skip=1" >> "$GITHUB_OUTPUT"
-
-      - name: Cleanup old train pods (global)
-        run: |
-          set -euo pipefail
-          echo "[cleanup] deleting old train pods"
-          PODS=$(kubectl -n "$NS_LC" get pods -l job-name -o jsonpath='{.items[*].metadata.name}')
-          for p in $PODS; do
-            phase=$(kubectl -n "$NS_LC" get pod "$p" -o jsonpath='{.status.phase}')
-            reason=$(kubectl -n "$NS_LC" get pod "$p" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
-            if [ "$phase" = "Running" ] || [ "$reason" = "ContainerCreating" ]; then continue; fi
-            kubectl -n "$NS_LC" delete pod "$p" --ignore-not-found || true
-          done
 
       - name: Render Train Job manifest
         run: |
@@ -266,25 +182,26 @@ jobs:
       - name: Apply Train Job
         run: |
           set -euo pipefail
-          echo "[apply] applying ${JOB_NAME}"
           kubectl -n "${NS_LC}" delete job "${JOB_NAME}" --ignore-not-found --wait=true || true
-          if ! kubectl -n "${NS_LC}" apply -f /tmp/train-job.yaml; then
-            echo "::error ::Failed to apply job manifest"
-            kubectl -n "${NS_LC}" get events --sort-by=.metadata.creationTimestamp | tail -40 || true
-            exit 1
-          fi
+          kubectl -n "${NS_LC}" apply -f /tmp/train-job.yaml
           kubectl -n "${NS_LC}" get job "${JOB_NAME}"
 
+      # === BUG FIX: POD_NAME 셸 변수 설정 + 검사 ===
       - name: Wait for Train Pod to appear
         run: |
           set -euo pipefail
           echo "[wait] waiting pod of job=${JOB_NAME}"
+          POD_NAME=""
           for i in {1..60}; do
-            P=$(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" --no-headers 2>/dev/null | awk '{print $1}' | head -n1)
-            if [ -n "${P}" ]; then echo "POD_NAME=${P}" >> "$GITHUB_ENV"; echo "[wait] pod=${P}"; break; fi
+            POD_NAME="$(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" --no-headers 2>/dev/null | awk 'NR==1{print $1}')"
+            if [ -n "${POD_NAME}" ]; then
+              echo "POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
+              echo "[wait] pod=${POD_NAME}"
+              break
+            fi
             sleep 5
           done
-          if [ -z "${POD_NAME:-}" ]; then
+          if [ -z "${POD_NAME}" ]; then
             echo "::error ::Pod not appeared"
             kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
             kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
@@ -295,7 +212,6 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=60m "job/${JOB_NAME}"
-          echo "[logs] trainer/fetch-src"
           kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=300 || true
           kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=100 || true
 
