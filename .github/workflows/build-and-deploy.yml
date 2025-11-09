@@ -206,7 +206,6 @@ jobs:
           ACTOR:    ${{ github.actor }}
         run: |
           set -euo pipefail
-
           IMAGE_BASE="${IMAGE_RUNTIME}"
           RKEY="${IMAGE_RUNTIME_KEY}"
           IMAGE_TAGGED="${IMAGE_BASE}-${RKEY}"
@@ -228,7 +227,6 @@ jobs:
             DIGEST="${DIGEST_FROM_LOG}"
           else
             echo "[info] Falling back to Registry API with PAT"
-
             REG_TOKEN="$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
               "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
               | jq -r '.token')"
@@ -236,14 +234,12 @@ jobs:
               echo "? Failed to obtain registry token. Check package permission/visibility and PAT scopes (read:packages, SSO)."
               exit 1
             fi
-
             ACCEPT_HEADER="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
             HDRS="$(mktemp)"
             curl -fsSL -D "${HDRS}" -o /dev/null \
               -H "Authorization: Bearer ${REG_TOKEN}" \
               -H "Accept: ${ACCEPT_HEADER}" \
               "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}"
-
             DIGEST="$(awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"");print $2}' "${HDRS}" | tail -n1)"
             if [ -z "${DIGEST}" ]; then
               echo "? Docker-Content-Digest not found. Is the tag present? Check headers below."
@@ -265,24 +261,19 @@ jobs:
         run: |
           set -euo pipefail
           echo "[cleanup] deleting train pods not Running/ContainerCreating (all previous jobs)"
-
           PODS=$(kubectl -n "$NS_LC" get pods -l job-name -o jsonpath='{.items[*].metadata.name}')
           if [ -z "$PODS" ]; then
             echo "[cleanup] no train pods found at all"
             exit 0
           fi
-
           for pod in $PODS; do
             phase=$(kubectl -n "$NS_LC" get pod "$pod" -o jsonpath='{.status.phase}')
             reason=$(kubectl -n "$NS_LC" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
-
             echo "[inspect] pod=$pod phase=$phase reason=$reason"
-
             if [ "$phase" = "Running" ] || [ "$reason" = "ContainerCreating" ]; then
               echo "[keep] $pod"
               continue
             fi
-
             echo "[delete] $pod (phase=$phase reason=$reason)"
             kubectl -n "$NS_LC" delete pod "$pod" --ignore-not-found || true
           done
@@ -319,13 +310,37 @@ jobs:
           kubectl -n "${NS_LC}" apply -f /tmp/train-job.yaml
           kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
 
+      # ✅ Pod 생성될 때까지 안전 대기(빈 목록 error 방지)
+      - name: Wait for Train Pod to appear
+        run: |
+          set -euo pipefail
+          echo "[wait] waiting for first pod of job=${JOB_NAME} in ns=${NS_LC}"
+          for i in {1..60}; do
+            PODS=$(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" --no-headers 2>/dev/null | awk '{print $1}')
+            if [ -n "${PODS}" ]; then
+              POD_NAME=$(echo "${PODS}" | head -n1)
+              echo "POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
+              echo "[wait] pod detected: ${POD_NAME}"
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "${POD_NAME:-}" ]; then
+            echo "::error ::Pod for job ${JOB_NAME} did not appear in time."
+            kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
+            kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
+            exit 1
+          fi
+
       - name: Wait Train → logs
         run: |
           set -euo pipefail
-          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=60m job/${JOB_NAME}
-          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NS_LC}" logs "$POD" -c trainer --tail=300 || true
-          kubectl -n "${NS_LC}" logs "$POD" -c fetch-src --tail=100 || true
+          # Job 완료 대기
+          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=60m "job/${JOB_NAME}"
+
+          echo "[logs] show trainer logs (any pod with job-name=${JOB_NAME})"
+          kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=300 || true
+          kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=100 || true
 
       # ====== 자동 프로모션 판단: 정확도 파싱 & 비교 ======
       - name: Parse accuracy from trainer logs
@@ -334,18 +349,15 @@ jobs:
           set -euo pipefail
           NS="${NS_LC}"
           JOB="${JOB_NAME}"
-
           echo "[info] read logs for job=${JOB} ns=${NS}"
           LINE="$(kubectl -n "${NS}" logs -l job-name="${JOB}" --all-containers=true --tail=-1 \
                     | tac | grep -m1 '^\[PROMOTE\] accuracy=' || true)"
-
           if [ -z "${LINE}" ]; then
             echo "::warning::[PROMOTE] marker not found in logs. Skip auto-promotion."
             echo "acc=NA" >>"$GITHUB_OUTPUT"
             echo "promote=no" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-
           ACC="$(echo "${LINE}" | sed -n 's/.*accuracy=\([0-9.]\+\).*/\1/p')"
           if [ -z "${ACC}" ]; then
             echo "::warning::Unable to parse accuracy from: ${LINE}"
@@ -353,7 +365,6 @@ jobs:
             echo "promote=no" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-
           DECIDE="$(awk -v a="${ACC}" -v t="${PROMOTE_THRESHOLD}" 'BEGIN{print (a+0>=t+0)?"yes":"no"}')"
           echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
           echo "acc=${ACC}" >>"$GITHUB_OUTPUT"
@@ -367,16 +378,13 @@ jobs:
           set -euo pipefail
           NS="${NS_LC}"
           JOB="${JOB_NAME}"
-
           echo "[info] read logs for job=${JOB} ns=${NS}"
           LINE="$(kubectl -n "${NS}" logs -l job-name="${JOB}" --all-containers=true --tail=-1 \
                     | tac | grep -m1 '^\[mlflow\] run_id=' || true)"
-
           if [ -z "${LINE}" ]; then
             echo "::error ::RUN_ID not found in logs"
             exit 1
           fi
-
           RUN_ID_VAL="$(echo "${LINE}" | sed -n 's/.*run_id=\([A-Za-z0-9]\{8,64\}\).*/\1/p')"
           if [ -z "${RUN_ID_VAL}" ]; then
             echo "::error ::failed to parse RUN_ID from: ${LINE}"
@@ -421,13 +429,16 @@ jobs:
         if: failure()
         run: |
           set -euo pipefail
-          POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           echo "---- describe job ----"
           kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
-          echo "---- describe pod ----"
-          kubectl -n "${NS_LC}" describe pod "${POD}" || true
+          echo "---- list pods by label ----"
+          kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
+          echo "---- describe pods ----"
+          for p in $(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o name 2>/dev/null); do
+            kubectl -n "${NS_LC}" describe "$p" || true
+          done
           echo "---- init logs ----"
-          kubectl -n "${NS_LC}" logs "${POD}" -c fetch-src --tail=200 || true
+          kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=200 || true
           echo "---- trainer logs ----"
-          kubectl -n "${NS_LC}" logs "${POD}" -c trainer --tail=500 || true
+          kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=500 || true
 
