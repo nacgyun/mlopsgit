@@ -1,44 +1,84 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: __KANIKO_JOB_NAME__
-  namespace: __NAMESPACE__
+  name: kaniko-build-${BUILD_ID}
+  namespace: ${NAMESPACE}
   labels:
+    app.kubernetes.io/name: kaniko-build
     allow-egress-internet: "true"
 spec:
   backoffLimit: 0
+  ttlSecondsAfterFinished: ${TTL_AFTER_FINISHED:-1800}  # 완료 후 30분 뒤 자동 정리(원하면 조절)
   template:
     metadata:
       labels:
+        app.kubernetes.io/name: kaniko-build
         allow-egress-internet: "true"
     spec:
       restartPolicy: Never
+      serviceAccountName: ${SERVICE_ACCOUNT:-default}
+
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: docker-config
+          secret:
+            secretName: ghcr-creds            # GHCR dockerconfigjson (이미 존재)
+        - name: host-certs
+          hostPath:
+            path: /etc/ssl/certs              # 노드 CA 번들을 그대로 마운트 (TLS 안정화)
+            type: Directory
+
+      # ✅ 깃은 여기서 처리: Kaniko는 디렉터리 컨텍스트만 사용
+      initContainers:
+        - name: fetch-source
+          image: alpine/git:2.45
+          env:
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gh-pat                # 이미 존재하는 시크릿
+                  key: PAT                    # 방금 확인한 실제 키
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              REPO_OWNER="${OWNER_LC:-${GITHUB_REPOSITORY_OWNER}}"
+              REPO_NAME="${REPO_LC:-${GITHUB_REPOSITORY#*/}}"
+              REPO_URL="https://oauth2:${GH_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}.git"
+              BRANCH="${GIT_BRANCH:-main}"   # 필요시 워크플로우에서 GIT_BRANCH 넘겨줘도 됨
+              echo "[clone] ${REPO_URL} (branch: ${BRANCH})"
+              git clone --depth=1 --branch "${BRANCH}" "${REPO_URL}" /workspace/repo
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:latest
+          args:
+            # ✅ 디렉터리 컨텍스트 사용 (git:// 제거)
+            - "--context=/workspace/repo"
+            - "--dockerfile=${DOCKERFILE_PATH:-ml/Dockerfile}"  # 프로젝트 구조에 맞게 유지
+            - "--destination=ghcr.io/${OWNER_LC:-${GITHUB_REPOSITORY_OWNER}}/${REPO_LC:-${GITHUB_REPOSITORY#*/}}:runtime-${IMAGE_RUNTIME_SHA}"
+            - "--cache=true"
+            # 필요시 플랫폼 지정
+            # - "--custom-platform=linux/amd64"
+            # 베이스 이미지 풀/레지스트리 푸시쪽 TLS를 더 느슨히 하려면(테스트용) 아래 옵션을 참고(실운영에서는 권장X)
+            # - "--skip-tls-verify-pull"
+            # - "--skip-tls-verify"
           env:
             - name: DOCKER_CONFIG
-              value: /kaniko/.docker
-            - name: SSL_CERT_DIR
-              value: /etc/ssl/certs
-          args:
-            # 공개 repo면 git context 그대로 사용 (특정 커밋)
-            - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
-            - --dockerfile=./Dockerfile.runtime
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
-            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:sha-__GIT_SHA__
-            - --snapshotMode=redo
-            - --compressed-caching=false
-            - --verbosity=info
+              value: /kaniko/.docker/
           volumeMounts:
+            - name: workspace
+              mountPath: /workspace
             - name: docker-config
-              mountPath: /kaniko/.docker
+              mountPath: /kaniko/.docker/
+            - name: host-certs
+              mountPath: /etc/ssl/certs
               readOnly: true
-      volumes:
-        - name: docker-config
-          secret:
-            secretName: ghcr-push
-            items:
-              - key: config.json
-                path: config.json
+      # (선택) 이미지 풀 필요 시
+      imagePullSecrets:
+        - name: ghcr-creds
 
