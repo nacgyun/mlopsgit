@@ -97,7 +97,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! command -v jq >/dev/null 2>&1; then
+          if ! command -v jq >/dev/null 2%; then
             sudo apt-get update -y >/dev/null 2>&1 || true
             sudo apt-get install -y jq >/dev/null 2>&1 || true
           fi
@@ -187,15 +187,15 @@ jobs:
           # 빌드 로그 요약
           kubectl -n "${NS_LC}" logs -l job-name="${KANIKO_JOB_NAME}" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
-      # Kaniko 실패 시 자동 덤프
+      # Kaniko 실패 시 자동 덤프 (NS_LC 없을 때도 동작)
       - name: Dump Kaniko job logs on failure
         if: failure()
         shell: bash
         env:
-          NS: ${{ env.NS_LC }}
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
           set -euo pipefail
+          NS="${NS_LC:-$NAMESPACE}"
           echo "---- describe job ----"; kubectl -n "${NS}" describe job "${KANIKO_JOB_NAME}" || true
           echo "---- pods ----"; kubectl -n "${NS}" get pods -l job-name="${KANIKO_JOB_NAME}" -o wide || true
           for p in $(kubectl -n "${NS}" get pods -l job-name="${KANIKO_JOB_NAME}" -o name 2>/dev/null); do
@@ -315,14 +315,16 @@ jobs:
             -d "$BODY"
           echo "[ok] dispatched"
 
+      # 워크플로우 실패 시 덤프 (NS_LC 없을 때도 동작)
       - name: On failure dump diagnostics
         if: failure()
         run: |
           set -euo pipefail
-          echo "---- describe job ----"; kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
-          echo "---- list pods ----"; kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
+          NS="${NS_LC:-$NAMESPACE}"
+          echo "---- describe job ----"; kubectl -n "${NS}" describe job "${JOB_NAME}" || true
+          echo "---- list pods ----"; kubectl -n "${NS}" get pods -l job-name="${JOB_NAME}" -o wide || true
           echo "---- describe pods ----"
-          for p in $(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o name 2>/dev/null); do kubectl -n "${NS_LC}" describe "$p" || true; done
-          echo "---- init logs ----"; kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=200 || true
-          echo "---- trainer logs ----"; kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=500 || true
+          for p in $(kubectl -n "${NS}" get pods -l job-name="${JOB_NAME}" -o name 2>/dev/null); do kubectl -n "${NS}" describe "$p" || true; done
+          echo "---- init logs ----"; kubectl -n "${NS}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=200 || true
+          echo "---- trainer logs ----"; kubectl -n "${NS}" logs -l job-name="${JOB_NAME}" -c trainer --tail=500 || true
 
