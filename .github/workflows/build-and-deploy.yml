@@ -40,8 +40,7 @@ jobs:
           S_GHCLONE: ${{ secrets.GH_CLONE_PAT }}
         run: |
           set -euo pipefail
-          # GHCR_PAT, PROMOTE_PAT는 필수
-          for k in S_GHCR S_PROMOTE; do
+          for k in S_GHCR S_PROMOTE S_GHCLONE; do
             v="${!k:-}"
             if [ -z "$v" ]; then
               echo "::error title=Missing secret::$k is EMPTY"; exit 1
@@ -49,10 +48,6 @@ jobs:
               echo "$k=OK(len=$(echo -n "$v" | wc -c))"
             fi
           done
-          # GH_CLONE_PAT 없으면 GHCR_PAT 재활용(경고만)
-          if [ -z "${S_GHCLONE:-}" ]; then
-            echo "::warning title=Using GHCR_PAT for git clone::GH_CLONE_PAT is missing; will reuse GHCR_PAT for cloning. Ensure GHCR_PAT has 'repo' scope if repo is private."
-          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -142,8 +137,6 @@ jobs:
         run: |
           set -euo pipefail
           : "${NAMESPACE:?NAMESPACE missing}"
-
-          # GHCR dockerconfigjson
           kubectl -n "${NAMESPACE}" delete secret ghcr-creds --ignore-not-found || true
           kubectl -n "${NAMESPACE}" create secret docker-registry ghcr-creds \
             --docker-server=ghcr.io \
@@ -151,14 +144,9 @@ jobs:
             --docker-password="${GHCR_PAT}" \
             --docker-email="${GH_USER}@users.noreply.github.com"
 
-          # git clone PAT: GH_CLONE_PAT 없으면 GHCR_PAT 재사용
-          CLONE_TOKEN="${GH_CLONE_PAT:-$GHCR_PAT}"
-          if [ -z "${CLONE_TOKEN}" ]; then
-            echo "::error ::No token available for cloning (GH_CLONE_PAT and GHCR_PAT both empty)"; exit 1
-          fi
           kubectl -n "${NAMESPACE}" delete secret gh-pat --ignore-not-found || true
           kubectl -n "${NAMESPACE}" create secret generic gh-pat \
-            --from-literal=PAT="${CLONE_TOKEN}"
+            --from-literal=PAT="${GH_CLONE_PAT}"
 
       - name: Kaniko runtime-build (render → apply)
         if: steps.tagcheck.outputs.need_build == 'true'
