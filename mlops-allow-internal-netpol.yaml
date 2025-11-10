@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-mlops-internal
+  namespace: mlops
+spec:
+  podSelector: {}         # 이 네임스페이스의 모든 파드가 대상으로 됨 (ingress rule 적용 대상)
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector: {}     # mlops 안 모든 pod에서 오는 트래픽 허용
+  egress:
+  - to:
+    - podSelector: {}     # mlops 안 모든 pod으로 나가는 트래픽 허용
+

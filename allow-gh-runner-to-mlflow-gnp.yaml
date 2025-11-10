@@ -1,0 +1,16 @@
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: allow-gh-runner-to-mlflow
+spec:
+  selector: "app == 'gh-runner'"        # <-- gh-runner 파드의 label에 맞춰서 수정
+  types:
+  - Egress
+  egress:
+  - action: Allow
+    protocol: TCP
+    destination:
+      selector: "app == 'mlflow'"       # <-- mlflow 파드 label로 수정
+      ports:
+      - 5000
+

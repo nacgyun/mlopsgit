@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gh-runner-deploy-admin-binding      # 이름은 달라도 되긴 하는데 겹치면 patch로 바꿔도 됨
+  namespace: mlops
+subjects:
+  - kind: ServiceAccount
+    name: gh-runner-sa
+    namespace: mlops
+roleRef:
+  kind: Role
+  name: gh-runner-deploy-admin
+  apiGroup: rbac.authorization.k8s.io
+
