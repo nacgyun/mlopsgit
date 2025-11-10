@@ -1,139 +1,44 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: __JOB_NAME__            # e.g. train-job-<run_id>
+  name: __KANIKO_JOB_NAME__
   namespace: __NAMESPACE__
-  labels:
-    app: train
-    run-id: "__RUN_ID__"        # ${{ github.run_id }}
-    sha: "__GIT_SHA__"          # ${{ github.sha }}
-    build-id: "__BUILD_ID__"    # ${{ github.run_number }}-${{ github.run_attempt }}
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 7200   # 전체 타임아웃 (2시간)
   template:
     metadata:
       labels:
-        app: train
-        run-id: "__RUN_ID__"
-        sha: "__GIT_SHA__"
-        build-id: "__BUILD_ID__"
+        job-name: __KANIKO_JOB_NAME__
+        allow-egress-internet: "true"
     spec:
       restartPolicy: Never
-
-      dnsConfig:
-        options:
-          - name: ndots
-            value: "1"
-          - name: timeout
-            value: "2"
-          - name: attempts
-            value: "2"
-
-      imagePullSecrets:
-        - name: ghcr-pull
-
-      initContainers:
-        - name: fetch-src
-          image: alpine/git:2.45.2
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-lc"]
-          args:
-            - |
-              set -euo pipefail
-              echo "[fetch-src] start"
-              GIT_URL="${GITHUB_TOKEN:+https://oauth2:${GITHUB_TOKEN}@github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
-              GIT_URL="${GIT_URL:-https://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git}"
-              SHA="__GIT_SHA__"
-
-              git config --global http.lowSpeedLimit 1000
-              git config --global http.lowSpeedTime 20
-              git config --global core.longpaths true
-
-              mkdir -p /workspace && cd /workspace
-              git init
-              git remote add origin "$GIT_URL"
-
-              for i in 1 2 3; do
-                git fetch --filter=blob:none --no-tags origin \
-                  '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' && break
-                echo "[fetch-src] refs fetch retry $i"; sleep 3
-              done
-
-              for i in 1 2 3; do
-                git fetch origin "$SHA" && break
-                echo "[fetch-src] sha fetch retry $i"; sleep 3
-              done
-
-              git checkout --detach "$SHA"
-              echo "[fetch-src] checked out $SHA"
-              ls -al
-          env:
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: github-token
-                  key: token
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
-
       containers:
-        - name: trainer
-          image: __IMAGE__                   # e.g. ghcr.io/<owner>/<repo>:runtime-<sha or build_key>
-          imagePullPolicy: IfNotPresent
-          workingDir: /opt/app
-          resources:
-            limits:
-              memory: 5Gi                    # ✅ 메모리 제한 추가
-          env:
-            - name: PYTHONUNBUFFERED
-              value: "1"
-            - name: GIT_SHA
-              value: "__GIT_SHA__"
-            - name: RUN_ID
-              value: "__RUN_ID__"
-            - name: BUILD_ID
-              value: "__BUILD_ID__"
-            - name: MLFLOW_TRACKING_URI
-              value: "http://mlflow.mlops.svc.cluster.local:5000"
-            - name: MLFLOW_EXPERIMENT_NAME
-              value: "iris-rf"
-            - name: MLFLOW_S3_ENDPOINT_URL
-              value: "http://minio.mlops.svc.cluster.local:9000"
-            - name: AWS_DEFAULT_REGION
-              value: "us-east-1"
-            - name: AWS_EC2_METADATA_DISABLED
-              value: "true"
-            - name: AWS_S3_FORCE_PATH_STYLE
-              value: "true"
-            - name: GITHUB_RUN_ID
-              value: "__RUN_ID__"
-            - name: GIT_SHA
-              value: "__GIT_SHA__"
-            - name: GHCR_IMAGE
-              value: "__GHCR_IMAGE__"
-            - name: GHCR_TAG
-              value: "__GHCR_TAG__"
-            - name: GHCR_DIGEST
-              value: "__GHCR_DIGEST__"
-            - name: GHCR_IMAGE_REF
-              value: "__GHCR_IMAGE_REF__"
-          envFrom:
-            - secretRef:
-                name: s3-mlflow-creds
-          command: ["/bin/sh", "-lc"]
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.23.0
           args:
-            - |
-              set -eux
-              echo "[trainer] using image: __IMAGE__"
-              echo "[trainer] using code SHA: ${GIT_SHA}"
-              python -u ml/train.py
+            - --context=git://github.com/__GITHUB_OWNER__/__GITHUB_REPO__.git#__GIT_SHA__
+            - --dockerfile=Dockerfile.runtime
+            # 원래 방식: 태그 3개 푸시
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime
+            - --destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__BUILD_KEY__
+            - --cache=true
+            - --cache-repo=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__/cache
+            - --verbosity=info
+          env:
+            - name: GODEBUG
+              value: "ipv6=0"
+            - name: DOCKER_CONFIG
+              value: /kaniko/.docker
           volumeMounts:
-            - name: workspace
-              mountPath: /opt/app
-
+            - name: docker-config
+              mountPath: /kaniko/.docker
+              readOnly: true
       volumes:
-        - name: workspace
-          emptyDir: {}
+        - name: docker-config
+          secret:
+            secretName: docker-config
+            items:
+              - key: .dockerconfigjson
+                path: config.json
 

@@ -301,7 +301,7 @@ jobs:
               -e "s|__GHCR_IMAGE__|${GHCR_IMAGE}|g" \
               -e "s|__GHCR_TAG__|${GHCR_TAG}|g" \
               -e "s|__GHCR_DIGEST__|${GHCR_DIGEST}|g" \
-              -e "s|__GHCR_IMAGE_REF__|${GHCR_IMAGE_REF}|g" \
+              -e "s|__GHCR_IMAGE_REF__|${GHCR_IMAGE_REF__}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
 
           if grep -qE "__[A-Z0-9_]+__" /tmp/train-job.yaml; then
