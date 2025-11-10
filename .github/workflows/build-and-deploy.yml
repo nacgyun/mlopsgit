@@ -5,6 +5,7 @@ on:
   push:
     branches: [ master ]
 
+# GitHub 발급 GITHUB_TOKEN 권한 (+ actions:write 필요)
 permissions:
   contents: read
   packages: read
@@ -15,17 +16,13 @@ jobs:
     runs-on: [self-hosted, k8s]
 
     env:
-      # --- 공통 ---
       NAMESPACE: mlops
       JOB_BASENAME: train-job
       IMAGE_RUNTIME: ghcr.io/nacgyun/mlopsgit:runtime
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
-
-      # --- Auto-promotion ---
+      # 자동 프로모션 임계치
       PROMOTE_THRESHOLD: "0.97"
-
-      # --- (기존 MinIO 직주입 사용 중이면 유지; ConfigMap/Secret 전환 시 무시됨) ---
       MINIO_ENDPOINT: http://minio.mlops.svc.cluster.local:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -33,18 +30,11 @@ jobs:
       DATA_KEY: telco/WA_Fn-UseC_-Telco-Customer-Churn.csv
       MODEL_BUCKET: models
 
-      # --- 새 옵션 ---
-      # 캐시: 안정화 전 false 권장(메모리 피크 완화). 여유되면 true.
-      KANIKO_CACHE: "false"
-      # Dockerfile 경로
-      RUNTIME_DOCKERFILE: Dockerfile.runtime
-      # 수동 강제 빌드 토글
-      FORCE_RUNTIME_BUILD: "false"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 파이썬 필요(정확도 비교, 보조 스크립트 등)
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -68,6 +58,7 @@ jobs:
           echo "SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-12)" >> $GITHUB_ENV
           echo "RUN_ID=${GITHUB_RUN_ID}" >> $GITHUB_ENV
           echo "BUILD_ID=${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_ENV
+          # lowercase safe forms
           echo "OWNER_LC=$(echo "${GITHUB_OWNER:-$GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
           echo "REPO_LC=$(echo "${GITHUB_REPO:-${GITHUB_REPOSITORY#*/}}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
           echo "NS_LC=$(echo "${NAMESPACE}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
@@ -95,6 +86,7 @@ jobs:
             sudo apt-get update -y >/dev/null 2>&1 || true
             sudo apt-get install -y jq >/dev/null 2>&1 || true
           fi
+
           OWNER="${GITHUB_OWNER:-nacgyun}"
           REPO="${GITHUB_REPO:-mlopsgit}"
           TOKEN="${GHCR_PAT:-$GITHUB_TOKEN}"
@@ -124,26 +116,8 @@ jobs:
           fi
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
-      # ---- GHCR secret to cluster (kaniko pulls/pushes) ----
-      - name: Create/Update docker-config secret for GHCR
-        run: |
-          set -euo pipefail
-          kubectl -n "${NAMESPACE}" delete secret docker-config --ignore-not-found
-          AUTH=$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
-          cat > /tmp/dockerconfig.json <<EOF
-          {
-            "auths": {
-              "ghcr.io": { "auth": "${AUTH}" }
-            }
-          }
-          EOF
-          kubectl -n "${NAMESPACE}" create secret generic docker-config \
-            --from-file=.dockerconfigjson=/tmp/dockerconfig.json \
-            --type=kubernetes.io/dockerconfigjson
-
-      # ---- Kaniko build (강제 토글 또는 need_build) ----
       - name: Kaniko runtime-build (render → apply)
-        if: steps.tagcheck.outputs.need_build == 'true' || env.FORCE_RUNTIME_BUILD == 'true'
+        if: steps.tagcheck.outputs.need_build == 'true' && steps.changes.outputs.runtime_image == 'true'
         env:
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
@@ -156,12 +130,10 @@ jobs:
               -e "s|__GITHUB_REPO__|${REPO_LC}|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
               -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
-              -e "s|__KANIKO_CACHE__|${KANIKO_CACHE}|g" \
-              -e "s|__RUNTIME_DOCKERFILE__|${RUNTIME_DOCKERFILE}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
-          if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY|KANIKO_CACHE|RUNTIME_DOCKERFILE)__' /tmp/kaniko-job.yaml; then
-            echo "? placeholder left in kaniko-job.yaml"; sed -n '1,200p' /tmp/kaniko-job.yaml; exit 1
+          if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY)__' /tmp/kaniko-job.yaml; then
+            echo "? placeholder left in kaniko-job.yaml"; sed -n '1,180p' /tmp/kaniko-job.yaml; exit 1
           fi
 
           kubectl -n "${NS_LC}" create --dry-run=client -f /tmp/kaniko-job.yaml -o yaml >/dev/null
@@ -169,10 +141,7 @@ jobs:
 
           kubectl -n "${NS_LC}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found || true
           kubectl -n "${NS_LC}" apply -f /tmp/kaniko-job.yaml
-          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=60m "job/${KANIKO_JOB_NAME}" || \
-          (echo "⚠️ Kaniko job not complete. Showing logs..." && \
-           kubectl -n "${NS_LC}" logs "job/${KANIKO_JOB_NAME}" --all-containers --tail=-1 ; \
-           exit 1)
+          kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=30m "job/${KANIKO_JOB_NAME}"
 
           POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}')
           kubectl -n "${NS_LC}" logs "$POD" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
@@ -192,79 +161,128 @@ jobs:
           set -euo pipefail
           if [ -z "${GHCR_PAT:-}" ]; then
             echo "GHCR_PAT=? (not set in this workflow run)"
+            echo "Tip: Repo → Settings → Secrets and variables → Actions → New secret: GHCR_PAT"
           else
             echo "GHCR_PAT=? (present for this run)"
           fi
 
-      # ---- digest 조회: runtime-<BUILD_KEY> → 실패 시 :runtime 폴백 ----
-      - name: Resolve GHCR digest for runtime image (with fallback)
-        id: digest
+      - name: Preflight ? verify GHCR_PAT can read packages
         env:
-          IMAGE_RUNTIME: ${{ env.IMAGE_RUNTIME }}
-          IMAGE_RUNTIME_KEY: ${{ env.IMAGE_RUNTIME_KEY }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          OWNER_LC: ${{ env.OWNER_LC }}
+          REPO_LC:  ${{ env.REPO_LC }}
+          ACTOR:    ${{ github.actor }}
         run: |
           set -euo pipefail
-          IMAGE_BASE="${IMAGE_RUNTIME}"
-          RKEY="${IMAGE_RUNTIME_KEY}"
-          CANDIDATES=("${IMAGE_BASE}-${RKEY}" "${IMAGE_BASE}")  # 1) runtime-<key> 2) runtime
-
-          resolve_digest () {
-            local ref="$1" repo path tag token digest hdrs
-            repo="${ref#ghcr.io/}"
-            path="${repo%%:*}"
-            tag="${ref##*:}"
-            echo "[info] Resolving digest for ${ref}"
-
-            token="$(curl -fsSL -u "${{ github.actor }}:${{ secrets.GHCR_PAT }}" \
-                     "https://ghcr.io/token?service=ghcr.io&scope=repository:${path}:pull" \
-                     | jq -r '.token')"
-            test -n "$token" -a "$token" != "null"
-
-            hdrs="$(mktemp)"
-            curl -fsSL -D "$hdrs" -o /dev/null \
-              -H "Authorization: Bearer ${token}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-              "https://ghcr.io/v2/${path}/manifests/${tag}" || return 1
-
-            digest="$(awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"");print $2}' "$hdrs" | tail -n1)"
-            test -n "$digest" || return 1
-
-            {
-              echo "GHCR_IMAGE=ghcr.io/${path}"
-              echo "GHCR_TAG=${tag}"
-              echo "GHCR_DIGEST=${digest}"
-              echo "GHCR_IMAGE_REF=ghcr.io/${path}@${digest}"
-            } >> "$GITHUB_ENV"
-            echo "[ok] Resolved ${ref} -> ${digest}"
-          }
-
-          ok=false
-          for ref in "${CANDIDATES[@]}"; do
-            if resolve_digest "$ref"; then ok=true; break; fi
-          done
-
-          if ! $ok; then
-            echo "::error ::No runtime image found for tags: ${CANDIDATES[*]}. Run Kaniko build (FORCE_RUNTIME_BUILD=true) or change files to trigger build."
+          if [ -z "${GHCR_PAT:-}" ]; then
+            echo "? GHCR_PAT is not set. Create a classic PAT with scope read:packages (and repo if private), then add it to repo secrets."
             exit 1
           fi
+          curl -fsSL -u "${ACTOR}:${GHCR_PAT}" https://api.github.com/user >/dev/null || {
+            echo "? PAT invalid or SSO not enabled. If your org enforces SSO, click 'Enable SSO' on this PAT."
+            exit 1
+          }
+          TOKEN_JSON=$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER_LC}/${REPO_LC}:pull") || {
+            echo "? Failed to get registry token. Ensure package visibility/permission allows this repo/workflow to read."
+            exit 1
+          }
+          echo "$TOKEN_JSON" | jq -re '.token' >/dev/null || {
+            echo "? Registry token missing. Check Manage access on the package (or make it public)."
+            exit 1
+          }
+          echo "? GHCR_PAT looks good."
 
-      # ---- 기존 학습 전 클린업 ----
+      - name: Resolve GHCR digest for runtime image
+        id: digest
+        env:
+          NS_LC: ${{ env.NS_LC }}
+          IMAGE_RUNTIME: ${{ env.IMAGE_RUNTIME }}
+          IMAGE_RUNTIME_KEY: ${{ env.IMAGE_RUNTIME_KEY }}
+          OWNER_LC: ${{ env.OWNER_LC }}
+          REPO_LC:  ${{ env.REPO_LC }}
+          KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          ACTOR:    ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_BASE="${IMAGE_RUNTIME}"
+          RKEY="${IMAGE_RUNTIME_KEY}"
+          IMAGE_TAGGED="${IMAGE_BASE}-${RKEY}"
+          REPO_PATH="$(echo "${IMAGE_TAGGED#ghcr.io/}" | cut -d: -f1)"
+          TAG="$(echo "${IMAGE_TAGGED}" | cut -d: -f2)"
+          echo "[info] Resolving digest for ${IMAGE_TAGGED}"
+
+          DIGEST_FROM_LOG=""
+          if kubectl -n "${NS_LC}" get job "${KANIKO_JOB_NAME}" >/dev/null 2>&1; then
+            POD=$(kubectl -n "${NS_LC}" get pod -l job-name="${KANIKO_JOB_NAME}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "${POD:-}" ]; then
+              DIGEST_FROM_LOG="$(kubectl -n "${NS_LC}" logs "$POD" -c kaniko --tail=-1 2>/dev/null \
+                | awk '/digest:[[:space:]]*sha256:/ {print $NF}' \
+                | tail -n1 || true)"
+            fi
+          fi
+          if [ -n "${DIGEST_FROM_LOG}" ]; then
+            echo "[info] Got digest from Kaniko logs: ${DIGEST_FROM_LOG}"
+            DIGEST="${DIGEST_FROM_LOG}"
+          else
+            echo "[info] Falling back to Registry API with PAT"
+
+            REG_TOKEN="$(curl -fsSL -u "${ACTOR}:${GHCR_PAT}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull" \
+              | jq -r '.token')"
+            if [ -z "${REG_TOKEN}" ] || [ "${REG_TOKEN}" = "null" ]; then
+              echo "? Failed to obtain registry token. Check package permission/visibility and PAT scopes (read:packages, SSO)."
+              exit 1
+            fi
+
+            ACCEPT_HEADER="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+            HDRS="$(mktemp)"
+            curl -fsSL -D "${HDRS}" -o /dev/null \
+              -H "Authorization: Bearer ${REG_TOKEN}" \
+              -H "Accept: ${ACCEPT_HEADER}" \
+              "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}"
+
+            DIGEST="$(awk -F': ' 'tolower($1)=="docker-content-digest"{gsub(/\r/,"");print $2}' "${HDRS}" | tail -n1)"
+            if [ -z "${DIGEST}" ]; then
+              echo "? Docker-Content-Digest not found. Is the tag present? Check headers below."
+              sed -n '1,200p' "${HDRS}" || true
+              exit 1
+            fi
+          fi
+
+          IMAGE_REF="ghcr.io/${REPO_PATH}@${DIGEST}"
+          echo "[ok] Resolved ref: ${IMAGE_REF}"
+          {
+            echo "GHCR_IMAGE=ghcr.io/${REPO_PATH}"
+            echo "GHCR_TAG=${TAG}"
+            echo "GHCR_DIGEST=${DIGEST}"
+            echo "GHCR_IMAGE_REF=${IMAGE_REF}"
+          } >> "$GITHUB_ENV"
+
       - name: Cleanup old train pods (global)
         run: |
           set -euo pipefail
           echo "[cleanup] deleting train pods not Running/ContainerCreating (all previous jobs)"
+
           PODS=$(kubectl -n "$NS_LC" get pods -l job-name -o jsonpath='{.items[*].metadata.name}')
           if [ -z "$PODS" ]; then
             echo "[cleanup] no train pods found at all"
             exit 0
           fi
+
           for pod in $PODS; do
             phase=$(kubectl -n "$NS_LC" get pod "$pod" -o jsonpath='{.status.phase}')
             reason=$(kubectl -n "$NS_LC" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+
             echo "[inspect] pod=$pod phase=$phase reason=$reason"
+
             if [ "$phase" = "Running" ] || [ "$reason" = "ContainerCreating" ]; then
-              echo "[keep] $pod"; continue
+              echo "[keep] $pod"
+              continue
             fi
+
             echo "[delete] $pod (phase=$phase reason=$reason)"
             kubectl -n "$NS_LC" delete pod "$pod" --ignore-not-found || true
           done
@@ -309,21 +327,25 @@ jobs:
           kubectl -n "${NS_LC}" logs "$POD" -c trainer --tail=300 || true
           kubectl -n "${NS_LC}" logs "$POD" -c fetch-src --tail=100 || true
 
+      # ====== 자동 프로모션 판단: 정확도 파싱 & 비교 ======
       - name: Parse accuracy from trainer logs
         id: read_acc
         run: |
           set -euo pipefail
           NS="${NS_LC}"
           JOB="${JOB_NAME}"
+
           echo "[info] read logs for job=${JOB} ns=${NS}"
           LINE="$(kubectl -n "${NS}" logs -l job-name="${JOB}" --all-containers=true --tail=-1 \
                     | tac | grep -m1 '^\[PROMOTE\] accuracy=' || true)"
+
           if [ -z "${LINE}" ]; then
             echo "::warning::[PROMOTE] marker not found in logs. Skip auto-promotion."
             echo "acc=NA" >>"$GITHUB_OUTPUT"
             echo "promote=no" >>"$GITHUB_OUTPUT"
             exit 0
           fi
+
           ACC="$(echo "${LINE}" | sed -n 's/.*accuracy=\([0-9.]\+\).*/\1/p')"
           if [ -z "${ACC}" ]; then
             echo "::warning::Unable to parse accuracy from: ${LINE}"
@@ -331,29 +353,39 @@ jobs:
             echo "promote=no" >>"$GITHUB_OUTPUT"
             exit 0
           fi
+
           DECIDE="$(awk -v a="${ACC}" -v t="${PROMOTE_THRESHOLD}" 'BEGIN{print (a+0>=t+0)?"yes":"no"}')"
           echo "Parsed accuracy=${ACC}, threshold=${PROMOTE_THRESHOLD} -> promote=${DECIDE}"
           echo "acc=${ACC}" >>"$GITHUB_OUTPUT"
           echo "promote=${DECIDE}" >>"$GITHUB_OUTPUT"
 
+      # ====== MLflow RUN_ID 추출 (자동 프로모션 조건 충족 시) ======
       - name: Extract MLflow RUN_ID from trainer logs
         id: runid
         if: steps.read_acc.outputs.promote == 'yes'
         run: |
           set -euo pipefail
-          NS="${NS_LC}"; JOB="${JOB_NAME}"
+          NS="${NS_LC}"
+          JOB="${JOB_NAME}"
+
+          echo "[info] read logs for job=${JOB} ns=${NS}"
           LINE="$(kubectl -n "${NS}" logs -l job-name="${JOB}" --all-containers=true --tail=-1 \
                     | tac | grep -m1 '^\[mlflow\] run_id=' || true)"
+
           if [ -z "${LINE}" ]; then
-            echo "::error ::RUN_ID not found in logs"; exit 1
+            echo "::error ::RUN_ID not found in logs"
+            exit 1
           fi
+
           RUN_ID_VAL="$(echo "${LINE}" | sed -n 's/.*run_id=\([A-Za-z0-9]\{8,64\}\).*/\1/p')"
           if [ -z "${RUN_ID_VAL}" ]; then
-            echo "::error ::failed to parse RUN_ID from: ${LINE}"; exit 1
+            echo "::error ::failed to parse RUN_ID from: ${LINE}"
+            exit 1
           fi
           echo "run_id=${RUN_ID_VAL}" >> "$GITHUB_OUTPUT"
           echo "[info] parsed RUN_ID=${RUN_ID_VAL}"
 
+      # ====== 프로모션 워크플로 자동 호출 (workflow_dispatch) ======
       - name: Dispatch promote-selected-model (auto)
         if: steps.read_acc.outputs.promote == 'yes'
         env:
