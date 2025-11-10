@@ -31,7 +31,7 @@ spec:
           - name: attempts
             value: "2"
 
-      # GHCR private pull (리소스에 맞는 secret 이름 사용)
+      # GHCR private pull
       imagePullSecrets:
         - name: ghcr-pull
 
@@ -82,81 +82,34 @@ spec:
 
       containers:
         - name: trainer
-          image: __IMAGE__                 # ghcr.io/<owner>/<repo>:runtime-<key>
+          image: __IMAGE__                 # e.g. ghcr.io/<owner>/<repo>:runtime-<sha>
           imagePullPolicy: IfNotPresent
           workingDir: /opt/app
-          resources:                       # (2) 리소스 지정: Burstable로
-            requests:
-              cpu: "500m"
-              memory: "1Gi"
-            limits:
-              cpu: "2"
-              memory: "3Gi"
           env:
             - name: PYTHONUNBUFFERED       # 실시간 로깅
               value: "1"
+            - name: GIT_SHA
+              value: "__GIT_SHA__"
             - name: RUN_ID
               value: "__RUN_ID__"
             - name: BUILD_ID
               value: "__BUILD_ID__"
-            - name: GIT_SHA
-              value: "__GIT_SHA__"
-            # ===== MLflow =====
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.mlops.svc.cluster.local:5000"
             - name: MLFLOW_EXPERIMENT_NAME
               value: "iris-rf"
-            # ===== MinIO/S3 (표준 키; 코드에서 그대로 사용) =====
-            - name: S3_ENDPOINT
-              valueFrom:
-                configMapKeyRef:
-                  name: train-config        # (4) ConfigMap에 넣어둔 값
-                  key: S3_ENDPOINT
-            - name: S3_REGION
-              valueFrom:
-                configMapKeyRef:
-                  name: train-config
-                  key: S3_REGION
-            - name: S3_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: minio-cred          # (4) Secret에 자격증명
-                  key: S3_ACCESS_KEY
-            - name: S3_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: minio-cred
-                  key: S3_SECRET_KEY
-            # ===== 데이터 경로 및 스키마 =====
-            - name: DATA_S3_URI            # 예: s3://data/telco/  또는 단일 파일
-              valueFrom:
-                configMapKeyRef:
-                  name: train-config
-                  key: DATA_S3_URI
-            - name: DATA_FORMAT            # auto|csv|parquet
-              valueFrom:
-                configMapKeyRef:
-                  name: train-config
-                  key: DATA_FORMAT
-            - name: LABEL_COL              # 예: Churn
-              valueFrom:
-                configMapKeyRef:
-                  name: train-config
-                  key: LABEL_COL
-            - name: DROP_COLS              # 예: customerID
-              valueFrom:
-                configMapKeyRef:
-                  name: train-config
-                  key: DROP_COLS
-            # ===== AWS SDK 동작 관련(필수 아님, MinIO 권장 세팅) =====
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "http://minio.mlops.svc.cluster.local:9000"
             - name: AWS_DEFAULT_REGION
               value: "us-east-1"
             - name: AWS_EC2_METADATA_DISABLED
               value: "true"
             - name: AWS_S3_FORCE_PATH_STYLE
               value: "true"
-
-            # ===== GHCR 정보(로그/디버그용) =====
+            - name: GITHUB_RUN_ID
+              value: "__RUN_ID__"
+            - name: GIT_SHA
+              value: "__GIT_SHA__"
             - name: GHCR_IMAGE
               value: "__GHCR_IMAGE__"          # ghcr.io/<owner>/<repo>
             - name: GHCR_TAG
@@ -165,23 +118,17 @@ spec:
               value: "__GHCR_DIGEST__"         # sha256:....
             - name: GHCR_IMAGE_REF
               value: "__GHCR_IMAGE_REF__"      # ghcr.io/<owner>/<repo>@sha256:....
-
-          # (4) 민감정보/일반설정 분리 주입
           envFrom:
             - secretRef:
-                name: s3-mlflow-creds        # 기존 유지(있다면)
-            - secretRef:
-                name: minio-cred             # S3_ACCESS_KEY / S3_SECRET_KEY
-            - configMapRef:
-                name: train-config           # S3_ENDPOINT/REGION, DATA_*, LABEL/DROP_COLS
-
+                name: s3-mlflow-creds
           command: ["/bin/sh","-lc"]
           args:
             - |
               set -eux
               echo "[trainer] using image: __IMAGE__"
-              echo "[trainer] code SHA: ${GIT_SHA}"
-              python -u ml/train.py          # 내부에서 S3 → pandas 로딩
+              echo "[trainer] using code SHA: ${GIT_SHA}"
+              # -u로 stdout/stderr 즉시 flush
+              python -u ml/train.py
           volumeMounts:
             - name: workspace
               mountPath: /opt/app
