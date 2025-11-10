@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
   packages: read
-  actions: write  # 'workflows' 키는 없음
+  actions: write   # ← 이거만 있으면 됨 (workflows 키 없음)
 
 jobs:
   train-build-run:
@@ -32,7 +32,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 필수 시크릿 체크
       - name: Assert required secrets (no values logged)
         shell: bash
         env:
@@ -43,7 +42,8 @@ jobs:
           for k in S_GHCR S_PROMOTE; do
             v="${!k:-}"
             if [ -z "$v" ]; then
-              echo "::error title=Missing secret::$k is EMPTY"; exit 1
+              echo "::error title=Missing secret::$k is EMPTY"
+              exit 1
             else
               echo "$k=OK(len=$(echo -n "$v" | wc -c))"
             fi
@@ -99,11 +99,9 @@ jobs:
             sudo apt-get update -y >/dev/null 2>&1 || true
             sudo apt-get install -y jq >/dev/null 2>&1 || true
           fi
-
           OWNER="${GITHUB_OWNER:-nacgyun}"
           REPO="${GITHUB_REPO:-mlopsgit}"
           TOKEN="${GHCR_PAT:-$GITHUB_TOKEN}"
-
           if [ -f Dockerfile.runtime ] && [ -f ml/requirements.txt ]; then
             BUILD_KEY="$( (cat Dockerfile.runtime; echo; cat ml/requirements.txt) | sha256sum | awk '{print $1}')"
           elif [ -f Dockerfile.runtime ]; then
@@ -112,46 +110,34 @@ jobs:
             BUILD_KEY=""
           fi
           echo "build_key=${BUILD_KEY}" >> "$GITHUB_OUTPUT"
-
           tag_exists() {
             local tag="runtime-$1"
             curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
               "https://ghcr.io/v2/${OWNER}/${REPO}/manifests/${tag}" \
               -H "Accept: application/vnd.docker.distribution.manifest.v2+json" >/dev/null
           }
-
           NEED_BUILD=false
-          if [ -z "${BUILD_KEY}" ]; then
-            NEED_BUILD=true
-          elif tag_exists "${BUILD_KEY}"; then
-            NEED_BUILD=false
-          else
-            NEED_BUILD=true
+          if [ -z "${BUILD_KEY}" ]; then NEED_BUILD=true
+          elif tag_exists "${BUILD_KEY}"; then NEED_BUILD=false
+          else NEED_BUILD=true
           fi
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
-      # GHCR 인증 config.json을 Kaniko가 읽도록 보장
       - name: Ensure GHCR dockerconfig secret (ghcr-push)
         shell: bash
         env:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
-          GH_USER: ${{ env.GITHUB_OWNER }}
         run: |
           set -euo pipefail
           : "${NAMESPACE:?NAMESPACE missing}"
-          kubectl -n "${NAMESPACE}" delete secret ghcr-push --ignore-not-found || true
-          AUTH_B64="$(printf '%s:%s' "${GH_USER}" "${GHCR_PAT}" | base64 -w0 2>/dev/null || printf '%s' "${GH_USER}:${GHCR_PAT}" | base64)"
-          cat > /tmp/config.json <<EOF
-          {
-            "auths": {
-              "ghcr.io": { "auth": "${AUTH_B64}" }
-            }
-          }
-          EOF
-          kubectl -n "${NAMESPACE}" create secret generic ghcr-push --from-file=config.json=/tmp/config.json
+          kubectl -n "${NAMESPACE}" delete secret ghcr-push --ignore-not-found
+          kubectl -n "${NAMESPACE}" create secret docker-registry ghcr-push \
+            --docker-server=ghcr.io \
+            --docker-username="${GITHUB_OWNER}" \
+            --docker-password="${GHCR_PAT}" \
+            --docker-email="ci@example.com"
           kubectl -n "${NAMESPACE}" get secret ghcr-push -o yaml | head -n 20
 
-      # === 태그 없으면 Kaniko 빌드 실행 ===
       - name: Kaniko runtime-build (render → apply)
         if: steps.tagcheck.outputs.need_build == 'true'
         env:
@@ -159,7 +145,6 @@ jobs:
         run: |
           set -euxo pipefail
           : "${KANIKO_JOB_NAME:?}"; : "${IMAGE_RUNTIME:?}"; : "${GIT_SHA:?}"; : "${NS_LC:?}"
-
           sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
               -e "s|__NAMESPACE__|${NS_LC}|g" \
               -e "s|__GITHUB_OWNER__|${OWNER_LC}|g" \
@@ -167,21 +152,15 @@ jobs:
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
               -e "s|__BUILD_KEY__|${{ steps.tagcheck.outputs.build_key }}|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
-
           if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY)__' /tmp/kaniko-job.yaml; then
             echo "::error ::placeholder left in kaniko-job.yaml"; sed -n '1,200p' /tmp/kaniko-job.yaml; exit 1
           fi
-
           echo "----- rendered kaniko-job -----"; sed -n '1,200p' /tmp/kaniko-job.yaml
-
           kubectl -n "${NS_LC}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found --wait=true || true
           kubectl -n "${NS_LC}" apply -f /tmp/kaniko-job.yaml
           kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=45m "job/${KANIKO_JOB_NAME}"
-
-          # 빌드 로그 요약
           kubectl -n "${NS_LC}" logs -l job-name="${KANIKO_JOB_NAME}" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
-      # Kaniko 실패 시 자동 덤프
       - name: Dump Kaniko job logs on failure
         if: failure()
         shell: bash
@@ -221,13 +200,11 @@ jobs:
               -e "s|__GHCR_DIGEST__|${GHCR_DIGEST:-}|g" \
               -e "s|__GHCR_IMAGE_REF__|${GHCR_IMAGE_REF:-}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
-
           if grep -qE "__[A-Z0-9_]+__" /tmp/train-job.yaml; then
             echo "::error ::placeholder left in train-job.yaml"
             grep -nE "__[A-Z0-9_]+__" /tmp/train-job.yaml || true
             exit 1
           fi
-
           echo "----- rendered train-job -----"; sed -n '1,240p' /tmp/train-job.yaml
 
       - name: Apply Train Job
@@ -317,5 +294,5 @@ jobs:
           echo "---- describe pods ----"
           for p in $(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o name 2>/dev/null); do kubectl -n "${NS_LC}" describe "$p" || true; done
           echo "---- init logs ----"; kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=200 || true
-          echo "---- trainer logs ----"; kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=500 || true
+          echo "---- trainer logs ----"; kubectl -n "${NS_L_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=500 || true
 
