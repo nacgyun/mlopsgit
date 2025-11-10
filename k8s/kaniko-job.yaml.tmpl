@@ -30,7 +30,7 @@ spec:
 
       initContainers:
         - name: fetch-source
-          image: alpine/git:latest
+          image: alpine/git:2.45
           env:
             - name: GH_TOKEN
               valueFrom:
@@ -57,7 +57,7 @@ spec:
           args:
             - "--context=/workspace/repo"
             - "--dockerfile=ml/Dockerfile"
-            - "--destination=ghcr.io/__GITHUB_OWNER__/__IMAGE_REPO__:runtime-__BUILD_KEY__"
+            - "--destination=ghcr.io/__GITHUB_OWNER__/__GITHUB_REPO__:runtime-__GIT_SHA__"
             - "--cache=true"
           env:
             - name: DOCKER_CONFIG
