@@ -22,7 +22,7 @@ spec:
           emptyDir: {}
         - name: docker-config
           secret:
-            secretName: ghcr-creds        # GHCR dockerconfigjson (workflow에서 생성/갱신)
+            secretName: ghcr-creds        # GHCR dockerconfigjson (workflow에서 매 실행마다 생성/갱신)
         - name: host-certs
           hostPath:
             path: /etc/ssl/certs
