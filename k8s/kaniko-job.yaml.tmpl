@@ -22,13 +22,12 @@ spec:
           emptyDir: {}
         - name: docker-config
           secret:
-            secretName: ghcr-creds        # GHCR dockerconfigjson (workflow에서 매 실행마다 생성/갱신)
+            secretName: ghcr-creds
         - name: host-certs
           hostPath:
             path: /etc/ssl/certs
             type: Directory
 
-      # 깃은 init에서 처리 → Kaniko는 디렉터리 컨텍스트만 사용
       initContainers:
         - name: fetch-source
           image: alpine/git:latest
@@ -36,19 +35,17 @@ spec:
             - name: GH_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: gh-pat            # workflow가 생성하는 Opaque 시크릿
+                  name: gh-pat
                   key: PAT
-            - name: GIT_BRANCH
-              value: "master"             # 기본 브랜치(네 레포는 main 아님)
           command: ["/bin/sh","-lc"]
           args:
             - |
               set -euo pipefail
               REPO_OWNER="__GITHUB_OWNER__"
               REPO_NAME="__GITHUB_REPO__"
-              REPO_URL="https://${GH_TOKEN}:x-oauth-basic@github.com/${REPO_OWNER}/${REPO_NAME}.git"
-              BRANCH="${GIT_BRANCH}"
-              echo "[clone] ${REPO_OWNER}/${REPO_NAME} (branch: ${BRANCH})"
+              REPO_URL="https://oauth2:${GH_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}.git"
+              BRANCH="${GIT_BRANCH:-main}"
+              echo "[clone] ${REPO_URL} (branch: ${BRANCH})"
               git clone --depth=1 --branch "${BRANCH}" "${REPO_URL}" /workspace/repo
           volumeMounts:
             - name: workspace
