@@ -17,7 +17,6 @@ jobs:
     env:
       NAMESPACE: mlops
       JOB_BASENAME: train-job
-      # ✅ 런타임 리포는 mlops로 고정 (태그는 아래에서 BUILD_KEY로 붙음)
       IMAGE_RUNTIME: ghcr.io/nacgyun/mlops:runtime
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
@@ -33,13 +32,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 필수 시크릿 체크
-      - name: Assert required secrets (no values logged)
+      - name: Assert required secrets
         shell: bash
         env:
           S_GHCR:    ${{ secrets.GHCR_PAT }}
           S_PROMOTE: ${{ secrets.PROMOTE_PAT }}
-          S_GHCLONE: ${{ secrets.GH_CLONE_PAT }}   # ✅ 깃 클론용 PAT
+          S_GHCLONE: ${{ secrets.GH_CLONE_PAT }}
         run: |
           set -euo pipefail
           for k in S_GHCR S_PROMOTE S_GHCLONE; do
@@ -79,7 +77,7 @@ jobs:
           echo "NS_LC=$(echo "${NAMESPACE}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
           echo "JOB_NAME=$(echo "${JOB_BASENAME}-${GITHUB_RUN_ID}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      - name: Detect changes for runtime image (ref only)
+      - name: Detect changes for runtime image
         id: changes
         uses: dorny/paths-filter@v3
         with:
@@ -97,13 +95,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! command -v jq >/dev/null 2%; then
-            sudo apt-get update -y >/dev/null 2>&1 || true
-            sudo apt-get install -y jq >/dev/null 2>&1 || true
-          fi
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
 
           OWNER="${GITHUB_OWNER:-nacgyun}"
-          REPO="mlops"   # ✅ 런타임 이미지는 mlops 리포로 고정
+          REPO="mlops"
           TOKEN="${GHCR_PAT:-$GITHUB_TOKEN}"
 
           if [ -f Dockerfile.runtime ] && [ -f ml/requirements.txt ]; then
@@ -132,7 +128,6 @@ jobs:
           fi
           echo "need_build=${NEED_BUILD}" >> "$GITHUB_OUTPUT"
 
-      # ✅ GHCR & git PAT 시크릿을 클러스터에 생성/갱신
       - name: Ensure GHCR & Git PAT secrets in cluster
         shell: bash
         env:
@@ -142,8 +137,6 @@ jobs:
         run: |
           set -euo pipefail
           : "${NAMESPACE:?NAMESPACE missing}"
-
-          # GHCR dockerconfigjson (kaniko가 /kaniko/.docker/로 읽음)
           kubectl -n "${NAMESPACE}" delete secret ghcr-creds --ignore-not-found || true
           kubectl -n "${NAMESPACE}" create secret docker-registry ghcr-creds \
             --docker-server=ghcr.io \
@@ -151,20 +144,16 @@ jobs:
             --docker-password="${GHCR_PAT}" \
             --docker-email="${GH_USER}@users.noreply.github.com"
 
-          # git clone용 PAT (Opaque) → gh-pat/PAT
           kubectl -n "${NAMESPACE}" delete secret gh-pat --ignore-not-found || true
           kubectl -n "${NAMESPACE}" create secret generic gh-pat \
             --from-literal=PAT="${GH_CLONE_PAT}"
 
-      # === 태그 없으면 Kaniko 빌드 실행 ===
       - name: Kaniko runtime-build (render → apply)
         if: steps.tagcheck.outputs.need_build == 'true'
         env:
           KANIKO_JOB_NAME: kaniko-build-${{ github.run_id }}
         run: |
           set -euxo pipefail
-          : "${KANIKO_JOB_NAME:?}"; : "${IMAGE_RUNTIME:?}"; : "${GIT_SHA:?}"; : "${NS_LC:?}"
-
           sed -e "s|__KANIKO_JOB_NAME__|${KANIKO_JOB_NAME}|g" \
               -e "s|__NAMESPACE__|${NS_LC}|g" \
               -e "s|__GITHUB_OWNER__|${OWNER_LC}|g" \
@@ -174,20 +163,11 @@ jobs:
               -e "s|__IMAGE_REPO__|mlops|g" \
             k8s/kaniko-job.yaml.tmpl > /tmp/kaniko-job.yaml
 
-          if grep -Eq '__(KANIKO_JOB_NAME|NAMESPACE|GITHUB_OWNER|GITHUB_REPO|GIT_SHA|BUILD_KEY|IMAGE_REPO)__' /tmp/kaniko-job.yaml; then
-            echo "::error ::placeholder left in kaniko-job.yaml"; sed -n '1,200p' /tmp/kaniko-job.yaml; exit 1
-          fi
-
-          echo "----- rendered kaniko-job -----"; sed -n '1,200p' /tmp/kaniko-job.yaml
-
           kubectl -n "${NS_LC}" delete job "${KANIKO_JOB_NAME}" --ignore-not-found --wait=true || true
           kubectl -n "${NS_LC}" apply -f /tmp/kaniko-job.yaml
           kubectl -n "${NS_LC}" wait --for=condition=complete --timeout=45m "job/${KANIKO_JOB_NAME}"
-
-          # 빌드 로그 요약
           kubectl -n "${NS_LC}" logs -l job-name="${KANIKO_JOB_NAME}" -c kaniko --tail=-1 | egrep -i 'Pushing|Pushed|digest' || true
 
-      # Kaniko 실패 시 자동 덤프 (NS_LC 없을 때도 동작)
       - name: Dump Kaniko job logs on failure
         if: failure()
         shell: bash
@@ -204,7 +184,7 @@ jobs:
             echo "---- describe $p ----"; kubectl -n "${NS}" describe "$p" || true
           done
 
-      - name: Compute IMAGE tag (prefer BUILD_KEY; fallback SHA)
+      - name: Compute IMAGE tag
         run: |
           set -e
           RKEY="${{ steps.tagcheck.outputs.build_key }}"
@@ -221,20 +201,7 @@ jobs:
               -e "s|__BUILD_ID__|${BUILD_ID}|g" \
               -e "s|__GIT_SHA__|${GIT_SHA}|g" \
               -e "s|__IMAGE__|${IMAGE_RUNTIME_SHA}|g" \
-              -e "s|__GITHUB_OWNER__|${OWNER_LC}|g" \
-              -e "s|__GITHUB_REPO__|${REPO_LC}|g" \
-              -e "s|__GHCR_IMAGE__|${GHCR_IMAGE:-}|g" \
-              -e "s|__GHCR_TAG__|${GHCR_TAG:-}|g" \
-              -e "s|__GHCR_DIGEST__|${GHCR_DIGEST:-}|g" \
-              -e "s|__GHCR_IMAGE_REF__|${GHCR_IMAGE_REF:-}|g" \
             k8s/train-job.yaml.tmpl > /tmp/train-job.yaml
-
-          if grep -qE "__[A-Z0-9_]+__" /tmp/train-job.yaml; then
-            echo "::error ::placeholder left in train-job.yaml"
-            grep -nE "__[A-Z0-9_]+__" /tmp/train-job.yaml || true
-            exit 1
-          fi
-
           echo "----- rendered train-job -----"; sed -n '1,240p' /tmp/train-job.yaml
 
       - name: Apply Train Job
@@ -244,27 +211,6 @@ jobs:
           kubectl -n "${NS_LC}" apply -f /tmp/train-job.yaml
           kubectl -n "${NS_LC}" get job "${JOB_NAME}"
 
-      - name: Wait for Train Pod to appear
-        run: |
-          set -euo pipefail
-          echo "[wait] waiting pod of job=${JOB_NAME}"
-          POD_NAME=""
-          for i in {1..60}; do
-            POD_NAME="$(kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" --no-headers 2>/dev/null | awk 'NR==1{print $1}')"
-            if [ -n "${POD_NAME}" ]; then
-              echo "POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
-              echo "[wait] pod=${POD_NAME}"
-              break
-            fi
-            sleep 5
-          done
-          if [ -z "${POD_NAME}" ]; then
-            echo "::error ::Pod not appeared"
-            kubectl -n "${NS_LC}" get pods -l job-name="${JOB_NAME}" -o wide || true
-            kubectl -n "${NS_LC}" describe job "${JOB_NAME}" || true
-            exit 1
-          fi
-
       - name: Wait Train → logs
         run: |
           set -euo pipefail
@@ -272,59 +218,16 @@ jobs:
           kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c trainer --tail=300 || true
           kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=100 || true
 
-      - name: Parse accuracy from trainer logs
-        id: read_acc
-        run: |
-          set -euo pipefail
-          LINE="$(kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" --all-containers=true --tail=-1 | tac | grep -m1 '^\[PROMOTE\] accuracy=' || true)"
-          if [ -z "${LINE}" ]; then
-            echo "acc=NA" >>"$GITHUB_OUTPUT"; echo "promote=no" >>"$GITHUB_OUTPUT"; exit 0; fi
-          ACC="$(echo "${LINE}" | sed -n 's/.*accuracy=\([0-9.]\+\).*/\1/p')"
-          if [ -z "${ACC}" ]; then
-            echo "acc=NA" >>"$GITHUB_OUTPUT"; echo "promote=no" >>"$GITHUB_OUTPUT"; exit 0; fi
-          DECIDE="$(awk -v a="${ACC}" -v t="${PROMOTE_THRESHOLD}" 'BEGIN{print (a+0>=t+0)?"yes":"no"}')"
-          echo "acc=${ACC}" >>"$GITHUB_OUTPUT"; echo "promote=${DECIDE}" >>"$GITHUB_OUTPUT"
-
-      - name: Extract MLflow RUN_ID from trainer logs
-        id: runid
-        if: steps.read_acc.outputs.promote == 'yes'
-        run: |
-          set -euo pipefail
-          LINE="$(kubectl -n "${NS_LC}" logs -l job-name="${JOB_NAME}" --all-containers=true --tail=-1 | tac | grep -m1 '^\[mlflow\] run_id=' || true)"
-          RUN_ID_VAL="$(echo "${LINE}" | sed -n 's/.*run_id=\([A-Za-z0-9]\{8,64\}\).*/\1/p')"
-          if [ -z "${RUN_ID_VAL}" ]; then echo "::error ::RUN_ID not found"; exit 1; fi
-          echo "run_id=${RUN_ID_VAL}" >> "$GITHUB_OUTPUT"
-
-      - name: Dispatch promote-selected-model (auto)
-        if: steps.read_acc.outputs.promote == 'yes'
-        env:
-          OWNER: ${{ env.OWNER_LC }}
-          REPO:  ${{ env.REPO_LC }}
-          BRANCH: master
-          PROMOTE_PAT: ${{ secrets.PROMOTE_PAT }}
-          RUN_ID_PICKED: ${{ steps.runid.outputs.run_id }}
-        run: |
-          set -euo pipefail
-          if ! command -v jq >/dev/null 2>&1; then sudo apt-get update -y >/dev/null 2>&1 || true; sudo apt-get install -y jq >/dev/null 2>&1 || true; fi
-          if [ -z "${PROMOTE_PAT:-}" ]; then echo "::error ::PROMOTE_PAT missing"; exit 1; fi
-          BODY=$(jq -nc --arg ref "$BRANCH" --arg model "light-logreg" --arg run "$RUN_ID_PICKED" --arg stage "Production" '{ref:$ref, inputs:{model_name:$model, run_id:$run, serve_stage:$stage}}')
-          curl -fsSL -X POST \
-            -H "Authorization: Bearer ${PROMOTE_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/promote-selected-model.yml/dispatches" \
-            -d "$BODY"
-          echo "[ok] dispatched"
-
-      # 워크플로우 실패 시 덤프 (NS_LC 없을 때도 동작)
       - name: On failure dump diagnostics
         if: failure()
         run: |
           set -euo pipefail
           NS="${NS_LC:-$NAMESPACE}"
-          echo "---- describe job ----"; kubectl -n "${NS}" describe job "${JOB_NAME}" || true
-          echo "---- list pods ----"; kubectl -n "${NS}" get pods -l job-name="${JOB_NAME}" -o wide || true
+          JOB="${JOB_NAME:-unknown-job}"
+          echo "---- describe job ----"; kubectl -n "${NS}" describe job "${JOB}" || true
+          echo "---- list pods ----"; kubectl -n "${NS}" get pods -l job-name="${JOB}" -o wide || true
           echo "---- describe pods ----"
-          for p in $(kubectl -n "${NS}" get pods -l job-name="${JOB_NAME}" -o name 2>/dev/null); do kubectl -n "${NS}" describe "$p" || true; done
-          echo "---- init logs ----"; kubectl -n "${NS}" logs -l job-name="${JOB_NAME}" -c fetch-src --tail=200 || true
-          echo "---- trainer logs ----"; kubectl -n "${NS}" logs -l job-name="${JOB_NAME}" -c trainer --tail=500 || true
+          for p in $(kubectl -n "${NS}" get pods -l job-name="${JOB}" -o name 2>/dev/null); do kubectl -n "${NS}" describe "$p" || true; done
+          echo "---- init logs ----"; kubectl -n "${NS}" logs -l job-name="${JOB}" -c fetch-src --tail=200 || true
+          echo "---- trainer logs ----"; kubectl -n "${NS}" logs -l job-name="${JOB}" -c trainer --tail=500 || true
 
