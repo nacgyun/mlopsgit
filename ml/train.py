@@ -120,7 +120,7 @@ def load_telco_churn(csv_uri):
     num_cols = [c for c in X.columns if c not in cat_cols]
     preproc = ColumnTransformer([
         ("num", StandardScaler(), num_cols),
-        ("cat", OneHotEncoder(handle_unknown="ignore", sparse=False), cat_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
     ])
     return X, y, preproc, cat_cols, num_cols
 
