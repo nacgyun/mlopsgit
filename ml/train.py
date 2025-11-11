@@ -132,6 +132,10 @@ def main():
     csv_uri = _resolve_telco_csv_uri()
     X_all, y_all, preproc, cat_cols, num_cols = load_telco_churn(csv_uri)
     X_train_df, X_test_df, y_train, y_test = train_test_split(X_all, y_all, test_size=0.3, random_state=0, stratify=y_all)
+
+    y_train = y_train.reset_index(drop=True).to_numpy()
+    y_test  = y_test.reset_index(drop=True).to_numpy()
+
     preproc.fit(X_train_df)
     X_train = preproc.transform(X_train_df)
     X_test = preproc.transform(X_test_df)
