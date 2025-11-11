@@ -23,18 +23,18 @@ from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, log_loss
 try:
     from logs import log_json_line, log_ghcr_metadata_to_mlflow
 except Exception:
-    def log_json_line(obj): print(json.dumps(obj, ensure_ascii=False))
+    def log_json_line(obj): print(json.dumps(obj, ensure_ascii=False), flush=True)
     def log_ghcr_metadata_to_mlflow(): pass
 
 EXP_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "telco-churn")
 RUN_NAME = (os.getenv("GIT_SHA", "")[:12] or "run")
-EPOCHS_CAP = int(os.getenv("MLFLOW_EPOCHS", "10000"))  # 안전 상한
+EPOCHS_CAP = int(os.getenv("MLFLOW_EPOCHS", "10000"))
 BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "4096"))
 RANDOM_STATE = int(os.getenv("SEED", "42"))
 LR_ALPHA = float(os.getenv("LR_ALPHA", "0.0005"))
 TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "600"))
 EMA_ALPHA = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
-MODEL_TYPE = os.getenv("MODEL_TYPE", "gb").lower()  # sgd|gb|rf
+MODEL_TYPE = os.getenv("MODEL_TYPE", "gb").lower()
 TREES_PER_EPOCH = int(os.getenv("TREES_PER_EPOCH", "100"))
 
 DEFAULT_CSV_CANDIDATES = [
@@ -166,10 +166,9 @@ def main():
         raise ValueError(f"unknown MODEL_TYPE={MODEL_TYPE}")
 
     exp_id = ensure_experiment_id(EXP_NAME, client)
-
     with start_run_with_retry(exp_id, RUN_NAME) as run:
         run_id = run.info.run_id
-        print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
+        print(f"[mlflow] run_id={run_id}, exp_id={exp_id}", flush=True)
         log_ghcr_metadata_to_mlflow()
         mlmod.log_params({
             "dataset":"telco","model":MODEL_TYPE,"epochs_cap":EPOCHS_CAP,
@@ -194,7 +193,8 @@ def main():
                 ema = comp if ema is None else (EMA_ALPHA*comp + (1-EMA_ALPHA)*ema)
                 acc, f1, ll, elapsed, eta = _eval_and_log(clf, X_test, y_test, epoch, wall_start, comp, ema)
                 f1_hist.append(f1)
-                print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={comp:.2f}s elapsed={elapsed:.1f}s ETA~{eta:.1f}s")
+                log_json_line({"event":"epoch_metric","epoch":epoch,"accuracy":acc,"f1":f1,"log_loss":ll,"eta_sec":eta})
+                print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={comp:.2f}s elapsed={elapsed:.1f}s ETA~{eta:.1f}s", flush=True)
         else:
             while (time.perf_counter() - wall_start) < TARGET_WALL_SEC and epoch < EPOCHS_CAP:
                 epoch += 1
@@ -205,7 +205,9 @@ def main():
                 ema = comp if ema is None else (EMA_ALPHA*comp + (1-EMA_ALPHA)*ema)
                 acc, f1, ll, elapsed, eta = _eval_and_log(clf, X_test, y_test, epoch, wall_start, comp, ema)
                 f1_hist.append(f1)
-                print(f"[trees+{TREES_PER_EPOCH:03d} | {epoch:03d}] acc={acc:.4f} f1={f1:.4f} trees={getattr(clf,'n_estimators',0)} comp={comp:.2f}s elapsed={elapsed:.1f}s ETA~{eta:.1f}s")
+                log_json_line({"event":"epoch_metric","epoch":epoch,"n_estimators":getattr(clf,"n_estimators",None),
+                               "accuracy":acc,"f1":f1,"log_loss":ll,"eta_sec":eta})
+                print(f"[trees+{TREES_PER_EPOCH:03d} | {epoch:03d}] acc={acc:.4f} f1={f1:.4f} trees={getattr(clf,'n_estimators',0)} comp={comp:.2f}s elapsed={elapsed:.1f}s ETA~{eta:.1f}s", flush=True)
 
         total = time.perf_counter() - wall_start
         mlmod.log_metric("train_time_total_sec", total)
@@ -231,7 +233,7 @@ def main():
         mlmod.log_artifact("input_example.json")
 
         final_acc = float(accuracy_score(y_test, final_pipe.predict(X_test_df)))
-        print(f"[PROMOTE] accuracy={final_acc:.5f}")
+        print(f"[PROMOTE] accuracy={final_acc:.5f}", flush=True)
         print("✅ Train done.", flush=True)
 
 if __name__ == "__main__":
