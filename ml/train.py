@@ -28,14 +28,14 @@ except Exception:
 
 EXP_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "telco-churn")
 RUN_NAME = (os.getenv("GIT_SHA", "")[:12] or "run")
-EPOCHS = int(os.getenv("MLFLOW_EPOCHS", "20"))
+EPOCHS_CAP = int(os.getenv("MLFLOW_EPOCHS", "10000"))  # 안전 상한
 BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "4096"))
 RANDOM_STATE = int(os.getenv("SEED", "42"))
 LR_ALPHA = float(os.getenv("LR_ALPHA", "0.0005"))
-TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "180"))
+TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "600"))
 EMA_ALPHA = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
-MODEL_TYPE = os.getenv("MODEL_TYPE", "sgd").lower()  # sgd|gb|rf
-TREES_PER_EPOCH = int(os.getenv("TREES_PER_EPOCH", "50"))
+MODEL_TYPE = os.getenv("MODEL_TYPE", "gb").lower()  # sgd|gb|rf
+TREES_PER_EPOCH = int(os.getenv("TREES_PER_EPOCH", "100"))
 
 DEFAULT_CSV_CANDIDATES = [
     "s3://data/telco/Telco-Customer-Churn.csv",
@@ -116,6 +116,23 @@ def load_telco_churn(csv_uri):
     ])
     return X, y, preproc, cat_cols, num_cols
 
+def _eval_and_log(clf, X_test, y_test, epoch, wall_start, comp, ema):
+    y_pred = clf.predict(X_test)
+    acc = float(accuracy_score(y_test, y_pred))
+    f1  = float(f1_score(y_test, y_pred, average="macro"))
+    try:
+        if hasattr(clf, "predict_proba"):
+            y_proba = clf.predict_proba(X_test); ll = float(log_loss(y_test, y_proba))
+        else:
+            ll = float("nan")
+    except Exception:
+        ll = float("nan")
+    elapsed = time.perf_counter() - wall_start
+    eta = max(0.0, TARGET_WALL_SEC - elapsed)
+    mlmod.log_metrics({"accuracy":acc,"f1_score":f1,"log_loss":ll,
+                       "epoch_compute_sec":comp,"elapsed_sec":elapsed,"eta_sec":eta}, step=epoch)
+    return acc, f1, ll, elapsed, eta
+
 def main():
     wall_start = time.perf_counter()
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or mlmod.get_tracking_uri()
@@ -155,64 +172,40 @@ def main():
         print(f"[mlflow] run_id={run_id}, exp_id={exp_id}")
         log_ghcr_metadata_to_mlflow()
         mlmod.log_params({
-            "dataset":"telco","model":MODEL_TYPE,"epochs":EPOCHS,"batch_size":BATCH_SIZE,
-            "alpha":LR_ALPHA,"trees_per_epoch":(TREES_PER_EPOCH if MODEL_TYPE in ("gb","rf") else 0)
+            "dataset":"telco","model":MODEL_TYPE,"epochs_cap":EPOCHS_CAP,
+            "batch_size":BATCH_SIZE,"alpha":LR_ALPHA,
+            "trees_per_epoch":(TREES_PER_EPOCH if MODEL_TYPE in ("gb","rf") else 0),
+            "target_wall_sec":TARGET_WALL_SEC
         })
 
         f1_hist, ema = [], None
+        epoch = 0
+
         if MODEL_TYPE == "sgd":
             first_n = min(BATCH_SIZE, len(X_train))
             clf.partial_fit(X_train[:first_n], y_train[:first_n], classes=np.array([0,1], int))
-            for epoch in range(1, EPOCHS + 1):
+            while (time.perf_counter() - wall_start) < TARGET_WALL_SEC and epoch < EPOCHS_CAP:
+                epoch += 1
                 t0 = time.perf_counter()
                 for Xb, yb in batch_iter(X_train, y_train, BATCH_SIZE, shuffle=True,
                                          seed=RANDOM_STATE + epoch * 1000):
                     clf.partial_fit(Xb, yb)
                 comp = time.perf_counter() - t0
-                y_pred = clf.predict(X_test)
-                acc = float(accuracy_score(y_test, y_pred))
-                f1  = float(f1_score(y_test, y_pred, average="macro"))
-                try:
-                    y_proba = clf.predict_proba(X_test); ll = float(log_loss(y_test, y_proba))
-                except Exception:
-                    ll = float("nan")
                 ema = comp if ema is None else (EMA_ALPHA*comp + (1-EMA_ALPHA)*ema)
-                elapsed = time.perf_counter() - wall_start
-                eta = max(0.0, TARGET_WALL_SEC - elapsed)
-                mlmod.log_metrics({"accuracy":acc,"f1_score":f1,"log_loss":ll,
-                                   "epoch_compute_sec":comp,"elapsed_sec":elapsed,"eta_sec":eta}, step=epoch)
+                acc, f1, ll, elapsed, eta = _eval_and_log(clf, X_test, y_test, epoch, wall_start, comp, ema)
                 f1_hist.append(f1)
                 print(f"[epoch {epoch:03d}] acc={acc:.4f} f1={f1:.4f} comp={comp:.2f}s elapsed={elapsed:.1f}s ETA~{eta:.1f}s")
-                if elapsed >= TARGET_WALL_SEC:
-                    print(f"[info] target wall time ({TARGET_WALL_SEC:.0f}s) reached."); break
         else:
-            epoch = 0
-            while True:
+            while (time.perf_counter() - wall_start) < TARGET_WALL_SEC and epoch < EPOCHS_CAP:
                 epoch += 1
                 t0 = time.perf_counter()
                 clf.n_estimators += TREES_PER_EPOCH
                 clf.fit(X_train, y_train)
                 comp = time.perf_counter() - t0
-                y_pred = clf.predict(X_test)
-                acc = float(accuracy_score(y_test, y_pred))
-                f1  = float(f1_score(y_test, y_pred, average="macro"))
-                try:
-                    if hasattr(clf, "predict_proba"):
-                        y_proba = clf.predict_proba(X_test); ll = float(log_loss(y_test, y_proba))
-                    else:
-                        ll = float("nan")
-                except Exception:
-                    ll = float("nan")
                 ema = comp if ema is None else (EMA_ALPHA*comp + (1-EMA_ALPHA)*ema)
-                elapsed = time.perf_counter() - wall_start
-                eta = max(0.0, TARGET_WALL_SEC - elapsed)
-                mlmod.log_metrics({"accuracy":acc,"f1_score":f1,"log_loss":ll,
-                                   "epoch_compute_sec":comp,"elapsed_sec":elapsed,"eta_sec":eta,
-                                   "n_estimators": getattr(clf,"n_estimators", None)}, step=epoch)
+                acc, f1, ll, elapsed, eta = _eval_and_log(clf, X_test, y_test, epoch, wall_start, comp, ema)
                 f1_hist.append(f1)
                 print(f"[trees+{TREES_PER_EPOCH:03d} | {epoch:03d}] acc={acc:.4f} f1={f1:.4f} trees={getattr(clf,'n_estimators',0)} comp={comp:.2f}s elapsed={elapsed:.1f}s ETA~{eta:.1f}s")
-                if elapsed >= TARGET_WALL_SEC:
-                    print(f"[info] target wall time ({TARGET_WALL_SEC:.0f}s) reached."); break
 
         total = time.perf_counter() - wall_start
         mlmod.log_metric("train_time_total_sec", total)
