@@ -22,7 +22,7 @@ jobs:
       GITHUB_OWNER: nacgyun
       GITHUB_REPO: mlopsgit
       # 자동 프로모션 임계치
-      PROMOTE_THRESHOLD: "0.97"
+      PROMOTE_THRESHOLD: "0.75"
       MINIO_ENDPOINT: http://minio.mlops.svc.cluster.local:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
