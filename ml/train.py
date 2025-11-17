@@ -33,7 +33,7 @@ EPOCHS_CAP = int(os.getenv("MLFLOW_EPOCHS", "30"))
 BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "4096"))
 RANDOM_STATE = int(os.getenv("SEED", "42"))
 LR_ALPHA = float(os.getenv("LR_ALPHA", "0.0005"))
-TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "120")
+TARGET_WALL_SEC = float(os.getenv("TARGET_WALL_SEC", "120"))
 
 EMA_ALPHA = float(os.getenv("ETA_EMA_ALPHA", "0.2"))
 MODEL_TYPE = os.getenv("MODEL_TYPE", "gb").lower()
