@@ -394,9 +394,10 @@ jobs:
           BRANCH: master
           PROMOTE_PAT: ${{ secrets.PROMOTE_PAT }}   # classic PAT with 'workflow' scope
           RUN_ID_PICKED: ${{ steps.runid.outputs.run_id }}
+          MLFLOW_REGISTERED_MODEL_NAME: default_name
         run: |
           set -euo pipefail
-          if ! command -v jq >/dev/null 2>&1; then
+          if ! command -v jq >/dev/null 2>&1;
             sudo apt-get update -y >/dev/null 2>&1 || true
             sudo apt-get install -y jq >/dev/null 2>&1 || true
           fi
@@ -405,7 +406,7 @@ jobs:
             exit 1
           fi
           BODY=$(jq -nc --arg ref "$BRANCH" \
-                        --arg model "light-logreg" \
+                        --arg model "$MLFLOW_REGISTERED_MODEL_NAME" \
                         --arg run  "$RUN_ID_PICKED" \
                         --arg stage "Production" \
                         '{ref:$ref, inputs:{model_name:$model, run_id:$run, serve_stage:$stage}}')
